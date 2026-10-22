@@ -1,0 +1,27 @@
+name: open-side-release-artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  package:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build repository artifact bundle
+        run: |
+          mkdir -p dist
+          tar -czf dist/open-side-configs.tar.gz config docs scripts README.md LICENSE
+          sha256sum dist/open-side-configs.tar.gz > dist/open-side-configs.tar.gz.sha256
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-side-configs
+          path: dist/*

@@ -1,0 +1,9 @@
+amdgpu
+radeon
+nouveau
+i915
+snd_hda_intel
+kvm
+vhost_net
+wireguard
+zram

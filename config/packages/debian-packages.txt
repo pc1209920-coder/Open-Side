@@ -1,0 +1,8 @@
+linux-image-amd64
+gamemode
+mangohud
+wine
+winetricks
+steam-installer
+vulkan-tools
+mesa-vulkan-drivers

@@ -1,0 +1,7 @@
+containers:
+  - name: ubuntu-dev
+    image: docker.io/library/ubuntu:24.04
+  - name: fedora-gaming
+    image: registry.fedoraproject.org/fedora:latest
+  - name: arch-lab
+    image: quay.io/toolbx/arch-toolbox:latest

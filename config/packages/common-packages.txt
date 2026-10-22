@@ -1,0 +1,9 @@
+flatpak
+distrobox
+firejail
+apparmor
+nftables
+ufw
+zram-tools
+pipewire
+wireplumber

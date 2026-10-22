@@ -1,0 +1,13 @@
+linux-zen
+linux-zen-headers
+gamemode
+mangohud
+wine
+wine-gecko
+wine-mono
+steam
+lutris
+vulkan-radeon
+vulkan-intel
+lib32-vulkan-radeon
+lib32-vulkan-intel
