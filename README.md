@@ -1,51 +1,56 @@
 # Open-Side
 
-Open-Side is a starter repository for learning and practicing operating system reverse engineering in a structured and responsible way.
+Open-Side is an open-source operating-system engineering repository focused on a **security-first, gaming-ready, compatibility-driven** Linux distribution workflow.
 
-It now also includes an **agent-driven system blueprint** for designing a secure open-source OS distribution with support for gaming, entertainment, productivity, and application compatibility.
+## v1 Direction
 
-## Goals
-
-- Document reverse engineering workflows for OS internals.
-- Organize notes, findings, and references in one place.
-- Provide reproducible steps for static and dynamic analysis labs.
-- Keep work focused on legal, defensive, and educational research.
-
-## Scope
-
-This repository is intended for:
-
-- Kernel and boot process analysis
-- System call and driver behavior research
-- Binary format and memory layout investigation
-- VM-based experiments and debugging notes
+- Base pipeline: **Arch + Debian/Ubuntu hybrid** (`archiso` + `live-build` compatible)
+- Kernel baseline: **linux-zen** (Arch path)
+- Runtime compatibility: **Distrobox + Flatpak + Wine/Proton + Waydroid profile support**
+- License: **GPLv3**
 
 ## Repository Layout
 
-- `docs/` — process documentation, workflows, and study notes
-- `research/` — per-target analysis projects and findings
-- `samples/` — legally obtained sample binaries and metadata
-- `scripts/` — helper scripts for repeatable local analysis tasks
+- `/home/runner/work/Open-Side/Open-Side/config/` — build, security, gaming, compatibility, package, and hardware profile definitions
+- `/home/runner/work/Open-Side/Open-Side/scripts/` — executable local automation for profile detection, build prep, manifesting, verification, and audits
+- `/home/runner/work/Open-Side/Open-Side/docs/` — architecture, implementation, release model, workflows, and contributor guidance
+- `/home/runner/work/Open-Side/Open-Side/research/` — target-specific analysis and implementation experiments
 
-See `/home/runner/work/Open-Side/Open-Side/docs/PROJECT_STRUCTURE.md` for details.
+## Dual-Tier Hardware Profiles
 
-## Getting Started
+- `Performance-Lite` for low-end systems (aggressive zram, lower animation/latency budget)
+- `Gaming-Ultra` for high-end systems (performance governor, low-latency gaming stack)
 
-1. Work inside an isolated virtual machine.
-2. Create a new target folder under `research/`.
-3. Record all assumptions, steps, and outputs in that folder.
-4. Keep scripts deterministic and versioned in `scripts/`.
-5. Track references and conclusions in `docs/`.
+## Quick Start
 
-## Responsible Use
+1. Run local prep pipeline:
+   - `/home/runner/work/Open-Side/Open-Side/scripts/build_local.sh`
+2. Optional: force profile:
+   - `/home/runner/work/Open-Side/Open-Side/scripts/build_local.sh /home/runner/work/Open-Side/Open-Side/config/hardware/gaming-ultra.env`
+3. Build from generated outputs:
+   - Arch path: `build/archiso/profile` with `mkarchiso`
+   - Debian path: `build/live-build` with `lb build`
 
-- Analyze only software and systems you are legally allowed to inspect.
-- Do not use this repository for unauthorized access or disruption.
-- Prefer disclosure and defensive remediation when vulnerabilities are found.
+## CI/CD
 
-## Next Steps
+GitHub Actions include:
 
-- Fill in target-specific templates under `research/`.
-- Add tool setup instructions for your environment.
-- Add automation scripts for symbol extraction and diff workflows.
-- Follow `/home/runner/work/Open-Side/Open-Side/docs/SYSTEM_BLUEPRINT.md` and `/home/runner/work/Open-Side/Open-Side/docs/AGENT_ROLES.md` to coordinate work across specialized agents.
+- shell script linting with ShellCheck
+- manifest/security baseline verification
+- release artifact bundle generation on tags or manual dispatch
+
+## Core Security Controls
+
+- Hardened sysctl defaults
+- Default-deny nftables policy
+- AppArmor/Firejail baseline lists
+- DNS encryption-ready resolver profile
+- SHA256 manifest and artifact verification
+
+## Core Gaming & Compatibility Controls
+
+- GameMode + MangoHud defaults
+- PipeWire low-latency profile
+- Vulkan/Mesa package sets
+- Wine/Proton pre-configuration baseline
+- Flatpak remotes and Distrobox container templates
