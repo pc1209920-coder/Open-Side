@@ -2,6 +2,8 @@
 
 Open-Side is a starter repository for learning and practicing operating system reverse engineering in a structured and responsible way.
 
+It now also includes an **agent-driven system blueprint** for designing a secure open-source OS distribution with support for gaming, entertainment, productivity, and application compatibility.
+
 ## Goals
 
 - Document reverse engineering workflows for OS internals.
@@ -46,3 +48,4 @@ See `/home/runner/work/Open-Side/Open-Side/docs/PROJECT_STRUCTURE.md` for detail
 - Fill in target-specific templates under `research/`.
 - Add tool setup instructions for your environment.
 - Add automation scripts for symbol extraction and diff workflows.
+- Follow `/home/runner/work/Open-Side/Open-Side/docs/SYSTEM_BLUEPRINT.md` and `/home/runner/work/Open-Side/Open-Side/docs/AGENT_ROLES.md` to coordinate work across specialized agents.
