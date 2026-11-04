@@ -1,81 +1,57 @@
-# ⚡ Open-Side
+# Open-Side
 
-> Next-Gen MCP 2.0 Universal App Connection Engine & Dynamic Context Pruner
+An experimental, early-stage Node.js project that exposes a small set of tools over JSON-RPC 2.0 via STDIO, with simple keyword-based filtering of the tool list.
 
-[![Open-Side CI Pipeline](https://github.com/pc1209920-coder/Open-Side/actions/workflows/ci.yml/badge.svg)](https://github.com/pc1209920-coder/Open-Side/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Node Version](https://img.shields.io/badge/Node-v18%2B-green.svg)](https://nodejs.org/)
+![CI](https://github.com/pc1209920-coder/Open-Side/actions/workflows/ci.yml/badge.svg)
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 
-Open-Side is a lightweight, low-latency multiplexer and context-aware routing layer built on top of the **Model Context Protocol (MCP)**. It dynamically registers tool connectors and selectively prunes tool schemas based on runtime intent queries to prevent token bloat inside large language models like Claude.
+## Status
 
----
+Alpha. This is a learning project. It is not a complete MCP server yet.
 
-## 🚀 Key Features
+## What it does today
 
-* **Dynamic Context Pruning**: Automatically filters tool specifications by query keywords to minimize context window usage.
-* **JSON-RPC 2.0 Multiplexer**: Routes queries across multiple downstream MCP connectors over standard STDIO.
-* **Built-in System Diagnostics**: Native local health check connector exposing memory, platform, and uptime metrics.
-* **Zero Overhead**: Engineered entirely with native Node.js core modules without heavy third-party runtimes.
+- Keeps a registry of tools, grouped by namespace (for example `system.health_check`).
+- Handles two JSON-RPC methods over STDIO: `tools/list` and `tools/call`.
+- `tools/list` accepts an optional `intent` string and returns only the tools whose name or description contains one of its words.
+- Includes one built-in tool, `system.health_check`, which reports platform, memory use and uptime.
+- Uses only built-in Node.js modules.
 
----
+## What it does not do yet
 
-## 🛠️ Architecture
+- It does not implement the MCP `initialize` handshake, so MCP clients such as Claude Desktop will probably not connect to it yet.
+- It does not connect to other MCP servers.
+- Tool filtering is plain keyword matching, not semantic search.
 
-~~~text
-LLM (Claude / Agent)
-       │
-       ▼ (JSON-RPC 2.0 via STDIO)
-┌─────────────────────────────────┐
-│     Open-Side NexusRouter       │
-│  - Dynamic Context Pruner       │
-│  - Namespaced Tool Registry     │
-└────────┬───────────────┬────────┘
-         │               │
-         ▼               ▼
-   [System Bridge]  [Downstream MCP]
-~~~
+## Run it
 
----
+You need Node.js 18 or newer.
 
-## 📦 Installation & Usage
-
-### Prerequisites
-* Node.js v18.0.0 or higher
-
-### Running Locally
-
-~~~bash
+```
 git clone https://github.com/pc1209920-coder/Open-Side.git
 cd Open-Side
 node src/index.js
-~~~
+```
 
-### Claude Desktop Integration
-Add the following to your `claude_desktop_config.json`:
+Then type this line and press Enter:
 
-~~~json
-{
-  "mcpServers": {
-    "open-side": {
-      "command": "node",
-      "args": ["/absolute/path/to/Open-Side/src/index.js"]
-    }
-  }
-}
-~~~
+```
+{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"intent":"health"}}
+```
 
----
+## Run the tests
 
-## 🗺️ Roadmap
+```
+npm test
+```
 
-- [x] JSON-RPC 2.0 STDIO bridge
-- [x] Dynamic context pruning by keyword intent
-- [ ] SSE & WebSocket bidirectional streaming transport
-- [ ] Semantic vector caching for high-density tool registries
-- [ ] Sandboxed permission policies for local filesystem connectors
+## Roadmap
 
----
+- Implement the MCP `initialize` handshake
+- Connect to downstream MCP servers
+- Better tool filtering
+- HTTP/SSE transport
 
-## 📄 License
+## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT. See the LICENSE file.
