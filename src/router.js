@@ -10,6 +10,10 @@ export class NexusRouter extends EventEmitter {
     this.connectors = new Map();
     this.toolRegistry = new Map();
     this.maxContextTokens = config.maxContextTokens || 4096;
+
+    // Performance optimization: Cache tool list and search haystack
+    this._cachedToolList = null;
+    this._cachedToolSearch = null;
   }
 
   registerConnector(namespace, connectorConfig) {
@@ -32,24 +36,40 @@ export class NexusRouter extends EventEmitter {
       });
     }
 
+    // Invalidate caches when tools are modified
+    this._cachedToolList = null;
+    this._cachedToolSearch = null;
+
     this.emit('connector:registered', { namespace, toolCount: (connectorConfig.tools || []).length });
     return true;
   }
 
   discoverTools(intentQuery = '') {
-    const allTools = Array.from(this.toolRegistry.entries()).map(([id, spec]) => ({
-      name: id,
-      description: spec.description,
-      inputSchema: spec.inputSchema || { type: 'object', properties: {} }
-    }));
+    // Lazily rebuild cache
+    if (!this._cachedToolList) {
+      this._cachedToolList = [];
+      this._cachedToolSearch = [];
+      for (const [id, spec] of this.toolRegistry.entries()) {
+        const toolData = {
+          name: id,
+          description: spec.description,
+          inputSchema: spec.inputSchema || { type: 'object', properties: {} }
+        };
+        this._cachedToolList.push(toolData);
+        this._cachedToolSearch.push({
+          tool: toolData,
+          haystack: `${id} ${spec.description}`.toLowerCase()
+        });
+      }
+    }
 
-    if (!intentQuery.trim()) return allTools;
+    // Return deeply cloned objects to prevent accidental cache mutation by callers
+    if (!intentQuery.trim()) return structuredClone(this._cachedToolList);
 
     const terms = intentQuery.toLowerCase().split(/\s+/);
-    return allTools.filter(tool => {
-      const haystack = `${tool.name} ${tool.description}`.toLowerCase();
-      return terms.some(term => haystack.includes(term));
-    });
+    return this._cachedToolSearch
+      .filter(entry => terms.some(term => entry.haystack.includes(term)))
+      .map(entry => structuredClone(entry.tool));
   }
 
   async dispatchRequest(rpcPayload) {
