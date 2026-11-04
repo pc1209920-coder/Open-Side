@@ -83,10 +83,11 @@ export class NexusRouter extends EventEmitter {
           result: { content: [{ type: 'text', text: JSON.stringify(output) }] }
         };
       } catch (err) {
+        console.error(`[Open-Side] Tool execution error:`, err);
         return {
           jsonrpc: '2.0',
           id,
-          error: { code: -32000, message: err.message }
+          error: { code: -32000, message: 'Internal error during tool execution' }
         };
       }
     }
