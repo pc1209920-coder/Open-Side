@@ -1,4 +1,4 @@
-name: Open-Side CI Pipeline
+name: Open-Side CI
 
 on:
   push:
@@ -10,15 +10,18 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Verify Syntax
+      - name: Check syntax
         run: |
           node --check src/router.js
           node --check src/index.js
+
+      - name: Run tests
+        run: npm test
