@@ -1,0 +1,27 @@
+{
+  "name": "open-side",
+  "version": "0.2.0-alpha",
+  "description": "Next-Gen MCP 2.0 Universal App Connection Engine & JSON-RPC Multiplexer",
+  "main": "src/index.js",
+  "type": "module",
+  "bin": {
+    "open-side": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mcp-2.0",
+    "ai-agents",
+    "claude",
+    "json-rpc",
+    "multiplexer",
+    "orchestrator"
+  ],
+  "author": "Pratyush Chaudhary",
+  "license": "MIT"
+}
