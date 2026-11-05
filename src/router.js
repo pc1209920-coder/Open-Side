@@ -10,6 +10,8 @@ export class NexusRouter extends EventEmitter {
     this.connectors = new Map();
     this.toolRegistry = new Map();
     this.maxContextTokens = config.maxContextTokens || 4096;
+    // ⚡ Bolt: Cache for discoverTools output to prevent redundant object allocations
+    this._cachedTools = null;
   }
 
   registerConnector(namespace, connectorConfig) {
@@ -32,16 +34,24 @@ export class NexusRouter extends EventEmitter {
       });
     }
 
+    // ⚡ Bolt: Invalidate tool cache when new tools are registered
+    this._cachedTools = null;
+
     this.emit('connector:registered', { namespace, toolCount: (connectorConfig.tools || []).length });
     return true;
   }
 
   discoverTools(intentQuery = '') {
-    const allTools = Array.from(this.toolRegistry.entries()).map(([id, spec]) => ({
-      name: id,
-      description: spec.description,
-      inputSchema: spec.inputSchema || { type: 'object', properties: {} }
-    }));
+    // ⚡ Bolt: Memoize tool objects to avoid O(N) allocation on every tools/list call
+    if (!this._cachedTools) {
+      this._cachedTools = Array.from(this.toolRegistry.entries()).map(([id, spec]) => ({
+        name: id,
+        description: spec.description,
+        inputSchema: spec.inputSchema || { type: 'object', properties: {} }
+      }));
+    }
+
+    const allTools = this._cachedTools;
 
     if (!intentQuery.trim()) return allTools;
 
