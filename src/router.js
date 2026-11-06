@@ -53,6 +53,14 @@ export class NexusRouter extends EventEmitter {
   }
 
   async dispatchRequest(rpcPayload) {
+    if (!rpcPayload || typeof rpcPayload !== 'object' || Array.isArray(rpcPayload)) {
+      return {
+        jsonrpc: '2.0',
+        id: rpcPayload?.id || null,
+        error: { code: -32600, message: 'Invalid Request: payload must be a JSON object' }
+      };
+    }
+
     const { id, method, params } = rpcPayload;
 
     if (method === 'tools/list') {
@@ -83,10 +91,11 @@ export class NexusRouter extends EventEmitter {
           result: { content: [{ type: 'text', text: JSON.stringify(output) }] }
         };
       } catch (err) {
+        console.error(`[Open-Side] Security: tool execution error for ${toolName}:`, err);
         return {
           jsonrpc: '2.0',
           id,
-          error: { code: -32000, message: err.message }
+          error: { code: -32000, message: 'An internal error occurred during tool execution' }
         };
       }
     }
