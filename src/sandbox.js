@@ -1,6 +1,12 @@
 const vm = require('node:vm');
 const os = require('node:os');
 
+// Cache static OS metrics to optimize telemetry polling.
+// os.cpus() is a costly call as it allocates object structures for all cores on every invocation.
+// These values remain constant during the process lifetime.
+const CPU_COUNT = os.cpus().length || 1;
+const TOTAL_MEM = os.totalmem();
+
 class StandbySandbox {
   constructor(config = {}) {
     this.maxExecutionMs = config.maxExecutionMs || 1500;
@@ -8,12 +14,12 @@ class StandbySandbox {
   }
 
   isDeviceInStandby() {
-    const normalizedLoad = (os.loadavg()[0] || 0.1) / (os.cpus().length || 1);
-    const freeMemRatio = os.freemem() / os.totalmem();
+    const normalizedLoad = (os.loadavg()[0] || 0.1) / CPU_COUNT;
+    const freeMemRatio = os.freemem() / TOTAL_MEM;
     return {
       standbyReady: normalizedLoad < this.maxCpuLoadThreshold && freeMemRatio > 0.05,
       metrics: {
-        cpuCount: os.cpus().length || 1,
+        cpuCount: CPU_COUNT,
         normalizedLoad: Number(normalizedLoad.toFixed(3)),
         freeMemoryMB: Math.round(os.freemem() / 1048576)
       }
