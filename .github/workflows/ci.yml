@@ -20,6 +20,8 @@ jobs:
 
       - name: Check syntax
         run: |
+          node --check src/crypto.js
+          node --check src/sandbox.js
           node --check src/router.js
           node --check src/index.js
 
