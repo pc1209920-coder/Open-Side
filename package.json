@@ -1,22 +1,24 @@
 {
-  "name": "open-side",
-  "version": "0.2.0-alpha",
-  "description": "Experimental Node.js JSON-RPC tool registry over STDIO with keyword-based tool filtering",
+  "name": "open-side-protocol",
+  "version": "0.4.2",
+  "description": "Decentralized P2P compute grid pooling idle standby hardware for distributed task execution.",
   "main": "src/index.js",
-  "type": "module",
-  "bin": {
-    "open-side": "./src/index.js"
-  },
+  "type": "commonjs",
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test"
+    "test": "node test/mesh.test.js"
   },
   "keywords": [
-    "mcp",
-    "model-context-protocol",
-    "json-rpc",
-    "nodejs"
+    "grid-computing",
+    "distributed-systems",
+    "edge-computing",
+    "p2p-mesh",
+    "standby-compute",
+    "zero-trust-sandbox"
   ],
-  "author": "Pratyush Chaudhary",
-  "license": "MIT"
+  "author": "pc1209920-coder",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
