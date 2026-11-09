@@ -32,7 +32,7 @@ class StandbySandbox {
       result: null
     });
 
-    const context = vm.createContext({ ...sandboxContext });
+    const context = vm.createContext({ ...sandboxContext }, { codeGeneration: { strings: false, wasm: false } });
     const script = new vm.Script(`"use strict"; result = (function(data) { ${shard.taskCode} })(input);`);
     const start = performance.now();
     script.runInContext(context, { timeout: this.maxExecutionMs, displayErrors: false });

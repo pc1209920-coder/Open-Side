@@ -1,0 +1,4 @@
+## 2023-10-27 - VM Sandbox Escape via constructor injection
+**Vulnerability:** Remote Code Execution (RCE) via Node.js `vm` module sandbox escape. The `StandbySandbox` allowed code generation from strings (e.g. `constructor.constructor("return process")()`), which provided access to the main Node.js process object and environment variables.
+**Learning:** Providing built-in classes like `Array` or `Object` or even just user input in a basic `vm.createContext` without disabling code generation allows malicious task code to break out of the sandbox.
+**Prevention:** Always restrict `codeGeneration` settings (specifically `strings: false` and `wasm: false`) when using `vm.createContext` to prevent arbitrary string compilation to executable code. Note: `vm` module itself is not a strict security mechanism, but disabling string codegen blocks the most common RCE paths via prototype constructor chain.
