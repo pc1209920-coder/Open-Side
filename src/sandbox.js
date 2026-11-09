@@ -5,15 +5,19 @@ class StandbySandbox {
   constructor(config = {}) {
     this.maxExecutionMs = config.maxExecutionMs || 1500;
     this.maxCpuLoadThreshold = config.maxCpuLoadThreshold || 0.85;
+
+    // ⚡ Bolt: Cache static hardware info to avoid expensive OS calls on every poll
+    this._cpuCount = os.cpus().length || 1;
+    this._totalMem = os.totalmem();
   }
 
   isDeviceInStandby() {
-    const normalizedLoad = (os.loadavg()[0] || 0.1) / (os.cpus().length || 1);
-    const freeMemRatio = os.freemem() / os.totalmem();
+    const normalizedLoad = (os.loadavg()[0] || 0.1) / this._cpuCount;
+    const freeMemRatio = os.freemem() / this._totalMem;
     return {
       standbyReady: normalizedLoad < this.maxCpuLoadThreshold && freeMemRatio > 0.05,
       metrics: {
-        cpuCount: os.cpus().length || 1,
+        cpuCount: this._cpuCount,
         normalizedLoad: Number(normalizedLoad.toFixed(3)),
         freeMemoryMB: Math.round(os.freemem() / 1048576)
       }
