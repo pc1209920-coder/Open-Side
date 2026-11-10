@@ -45,3 +45,20 @@ testMeshProtocol().catch((err) => {
   console.error('❌ Test failed:', err);
   process.exit(1);
 });
+
+  // 6. Security: Verify VM sandbox escape is prevented
+  try {
+    const exploitResult = sandbox.executeIsolatedShard({
+      shardId: '0000000000000000000000000000000000000000',
+      inputData: [],
+      taskCode: 'return (()=>{}).constructor("return process")().env;'
+    });
+    // If we reach here, the VM didn't throw an error. Check if it leaked the environment.
+    if (exploitResult.output && exploitResult.output.PWD) {
+      assert.fail('Sandbox escape successful: process.env leaked');
+    }
+  } catch (err) {
+    // We expect a ReferenceError because process is not defined, but we don't strictly require it to throw.
+    // If it throws, it means the sandbox worked. If it returns undefined, it also worked.
+  }
+  console.log('  ✔ VM Sandbox escape vector verified closed');

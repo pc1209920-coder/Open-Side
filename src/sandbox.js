@@ -21,24 +21,35 @@ class StandbySandbox {
   }
 
   executeIsolatedShard(shard) {
-    const sandboxContext = Object.freeze({
-      input: Object.freeze(shard.inputData),
-      Math,
-      JSON,
-      Array,
-      Object,
-      Number,
-      String,
-      result: null
-    });
+    // Create a pristine context detached from host object prototypes
+    const context = vm.createContext(Object.create(null));
 
-    const context = vm.createContext({ ...sandboxContext });
-    const script = new vm.Script(`"use strict"; result = (function(data) { ${shard.taskCode} })(input);`);
+    // Serialize input safely so it can be parsed natively inside the sandbox
+    const safeInput = JSON.stringify(shard.inputData);
+
+    const scriptCode = `
+      "use strict";
+      // Expose safe built-ins from the VM realm and construct our pristine environment
+      var Math = globalThis.Math;
+      var JSON = globalThis.JSON;
+      var Array = globalThis.Array;
+      var Object = globalThis.Object;
+      var Number = globalThis.Number;
+      var String = globalThis.String;
+
+      var input = JSON.parse(${JSON.stringify(safeInput)});
+      var result = (function(data) { ${shard.taskCode} })(input);
+      result;
+    `;
+
+    const script = new vm.Script(scriptCode);
     const start = performance.now();
-    script.runInContext(context, { timeout: this.maxExecutionMs, displayErrors: false });
+
+    // Execute within the isolated context
+    const result = script.runInContext(context, { timeout: this.maxExecutionMs, displayErrors: false });
     return {
       shardId: shard.shardId,
-      output: context.result,
+      output: result,
       executionTimeMs: Number((performance.now() - start).toFixed(2))
     };
   }

@@ -1,0 +1,4 @@
+## 2024-11-10 - [CRITICAL] Sandbox Escape via Context Object Prototypes
+**Vulnerability:** Node's `vm` module is used for executing isolated tasks, but the `sandboxContext` provided directly references host primitives like `Object`, `Array`, `JSON`, and `Math`. By accessing `.constructor.constructor('return process')()` from `this` or the `input` array inside the VM, arbitrary execution and environment exposure (`process.env`) can be achieved because the host primitives belong to the Node.js main thread context.
+**Learning:** Never pass objects or primitives instantiated in the host environment into a VM context as it allows escaping the sandbox via prototype chains.
+**Prevention:** Use `vm.createContext(Object.create(null))` to ensure a pristine context populated with VM-specific primitives, and inject data like `input` by serializing it as a JSON string and parsing it entirely within the VM script itself (`JSON.parse`).
