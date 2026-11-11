@@ -1,0 +1,4 @@
+## 2024-06-25 - Avoid Buffer Allocations in Hot Paths like getBucketIndex
+**Learning:** In the Kademlia DHT routing table, `getBucketIndex` is a hot path called frequently when adding, removing, and looking up contacts. Previously, it called `xorDistance()` which allocated a new `Buffer` instance to store the XOR result before checking it. Node.js `Buffer.alloc()` inside an inner loop causes significant garbage collection overhead and is much slower than performing the XOR operations directly on the input bytes. Furthermore, using a nested loop to find the leading zero bit in a byte is suboptimal compared to `Math.clz32()`.
+
+**Action:** Whenever doing bitwise distance or equality checks between byte arrays in a hot path, compute the byte-wise operation on the fly without allocating a temporary result array/buffer. Use `Math.clz32(byte) - 24` to compute the number of leading zero bits in a single byte efficiently instead of a manual loop.
