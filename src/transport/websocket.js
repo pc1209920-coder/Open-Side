@@ -470,7 +470,7 @@ class WebSocketConnection extends EventEmitter {
     if (this.readyState !== 1 || this.socket.destroyed) {
       const err = new Error('WebSocket is not open (readyState=' + this.readyState + ')');
       if (cb) cb(err);
-      else this.emit('error', err);
+      else if (this.listenerCount('error') > 0) this.emit('error', err);
       return;
     }
 
@@ -511,9 +511,16 @@ class WebSocketConnection extends EventEmitter {
 
   _sendCloseFrame(code = 1000, reason = '') {
     if (this.socket.destroyed || !this.socket.writable) return;
-    const reasonBuf = Buffer.from(reason, 'utf8');
+    let validCode = typeof code === 'number' && Number.isInteger(code) ? code : 1000;
+    if (validCode < 1000 || validCode > 4999 || (validCode >= 1004 && validCode <= 1006) || (validCode >= 1014 && validCode <= 2999)) {
+      validCode = 1002;
+    }
+    let reasonBuf = Buffer.from(String(reason), 'utf8');
+    if (reasonBuf.length > 123) {
+      reasonBuf = reasonBuf.subarray(0, 123);
+    }
     const payload = Buffer.allocUnsafe(2 + reasonBuf.length);
-    payload.writeUInt16BE(code, 0);
+    payload.writeUInt16BE(validCode, 0);
     reasonBuf.copy(payload, 2);
 
     try {
@@ -578,8 +585,22 @@ class WebSocketServer extends EventEmitter {
 
   _bindUpgrade(server) {
     this._onUpgrade = (req, socket, head) => {
-      if (this.path && !req.url.startsWith(this.path)) {
-        return; // Not our path, ignore or allow other handlers
+      let reqPath;
+      try {
+        reqPath = new URL(req.url, 'http://localhost').pathname;
+      } catch {
+        socket.destroy();
+        return;
+      }
+
+      if (this.path) {
+        const expectedPath = this.path.endsWith('/') ? this.path.slice(0, -1) : this.path;
+        const actualPath = reqPath.endsWith('/') && reqPath !== '/' ? reqPath.slice(0, -1) : reqPath;
+        if (actualPath !== expectedPath && !actualPath.startsWith(expectedPath + '/')) {
+          socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+          socket.destroy();
+          return;
+        }
       }
 
       const upgradeHeader = req.headers['upgrade'];
@@ -719,13 +740,14 @@ class WebSocketClient extends EventEmitter {
       ...(this.options.headers || {})
     };
 
+    const handshakeTimeout = this.options.handshakeTimeout || 10000;
     const reqOptions = {
       protocol: isSecure ? 'https:' : 'http:',
       hostname: parsed.hostname,
       port,
       path: parsed.pathname + (parsed.search || ''),
       headers: reqHeaders,
-      timeout: this.options.handshakeTimeout || 10000
+      timeout: handshakeTimeout
     };
     if (this.options.socketPath) {
       reqOptions.socketPath = this.options.socketPath;
@@ -733,6 +755,10 @@ class WebSocketClient extends EventEmitter {
 
     const req = httpMod.request(reqOptions);
     this._req = req;
+
+    req.on('timeout', () => {
+      req.destroy(new Error(`WebSocket handshake timed out after ${handshakeTimeout}ms`));
+    });
 
     req.on('upgrade', (res, socket, head) => {
       const accept = res.headers['sec-websocket-accept'];
@@ -778,7 +804,7 @@ class WebSocketClient extends EventEmitter {
       const err = new Error('WebSocket is not connected');
       if (typeof options === 'function') options(err);
       else if (cb) cb(err);
-      else this.emit('error', err);
+      else if (this.listenerCount('error') > 0) this.emit('error', err);
     }
   }
 

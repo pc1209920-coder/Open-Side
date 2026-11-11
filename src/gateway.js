@@ -74,14 +74,16 @@ class OpenSideGateway {
         });
       });
 
-      srv.on('error', (err) => {
+      const onListeningError = (err) => {
         reject(err);
-      });
+      };
+      srv.once('error', onListeningError);
 
       const isIpc = typeof target === 'string' && (target.startsWith('\\\\.\\pipe\\') || target.startsWith('/'));
 
       if (isIpc) {
         srv.listen(target, () => {
+          srv.removeListener('error', onListeningError);
           this.server = srv;
           this.port = 0;
           this.host = 'ipc';
@@ -91,6 +93,7 @@ class OpenSideGateway {
       } else {
         const listenPort = typeof target === 'number' ? target : this.port;
         srv.listen(listenPort, host, () => {
+          srv.removeListener('error', onListeningError);
           this.server = srv;
           const addr = srv.address();
           this.port = addr && typeof addr === 'object' ? addr.port : listenPort;
@@ -108,6 +111,9 @@ class OpenSideGateway {
   async close() {
     this._closing = true;
     if (this.server) {
+      if (this.server.closeAllConnections) {
+        this.server.closeAllConnections();
+      }
       await new Promise((resolve) => {
         this.server.close(() => resolve());
       });
@@ -275,6 +281,12 @@ class OpenSideGateway {
       return this._handleEmbeddings(req, res);
     }
 
+    // Anthropic-compatible /v1/messages endpoint
+    if (req.method === 'POST' && pathname === '/v1/messages') {
+      if (!this._checkAuth(req, res)) return;
+      return this._handleAnthropicMessages(req, res);
+    }
+
     // 404 for any other path
     this._sendError(res, 404, `Not Found: ${req.method} ${pathname}`, 'not_found');
   }
@@ -436,6 +448,81 @@ class OpenSideGateway {
       });
     } catch (err) {
       this._sendError(res, 500, `Compute Sea embeddings workload failed: ${err.message}`, 'api_error');
+    }
+  }
+
+  async _handleAnthropicMessages(req, res) {
+    let body;
+    try {
+      body = await this._readBody(req);
+    } catch (err) {
+      const code = err.statusCode || 400;
+      return this._sendError(res, code, err.message, code === 413 ? 'request_entity_too_large' : 'invalid_request_error');
+    }
+
+    const { messages, model = 'open-side-sea', max_tokens = 1024 } = body;
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return this._sendError(res, 400, "Missing or invalid 'messages' array in request body", 'invalid_request_error');
+    }
+
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      if (!m || typeof m !== 'object') {
+        return this._sendError(res, 400, `Invalid message at index ${i}: must be a non-null object`, 'invalid_request_error');
+      }
+    }
+
+    const workloadCode = `
+      return data.map(msg => {
+        const role = msg.role || 'user';
+        const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+        return {
+          role,
+          tokens: content.split(/\\s+/).filter(Boolean).length,
+          chars: content.length,
+          preview: content.slice(0, 100)
+        };
+      });
+    `;
+
+    try {
+      const seaResult = await this.sea.submitWorkload(workloadCode, messages, {
+        chunkSize: Math.max(1, Math.min(messages.length, 4))
+      });
+
+      const msgId = `msg_${crypto.randomUUID()}`;
+      const responseText = `[Open-Side ComputeSea] Workload executed across ${seaResult.shards?.length || 1} mesh shard(s). Processed ${messages.length} message(s). Total mesh compute cost: ${seaResult.totalCost || 0} credits.`;
+
+      const inputTokens = messages.reduce((acc, m) => acc + (m && typeof m.content === 'string' ? m.content.split(/\s+/).filter(Boolean).length : 0), 0);
+      const outputTokens = responseText.split(/\s+/).filter(Boolean).length;
+
+      this._sendJson(res, 200, {
+        id: msgId,
+        type: 'message',
+        role: 'assistant',
+        content: [
+          {
+            type: 'text',
+            text: responseText
+          }
+        ],
+        model,
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+        usage: {
+          input_tokens: inputTokens,
+          output_tokens: outputTokens
+        },
+        compute_sea: {
+          workloadId: seaResult.workloadId,
+          status: seaResult.status,
+          shardsCount: seaResult.shards?.length || 0,
+          totalCost: seaResult.totalCost,
+          durationMs: seaResult.durationMs
+        }
+      });
+    } catch (err) {
+      this._sendError(res, 500, `Compute Sea workload execution failed: ${err.message}`, 'api_error');
     }
   }
 }
