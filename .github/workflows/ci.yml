@@ -24,7 +24,7 @@ jobs:
       - name: Verify zero external dependencies
         run: node -e "const pkg = require('./package.json'); if (Object.keys(pkg.dependencies || {}).length || Object.keys(pkg.devDependencies || {}).length) process.exit(1);"
 
-      - name: Check syntax across all 7 modules
+      - name: Check syntax across all modules
         run: |
           node --check src/index.js
           node --check src/crypto.js
@@ -33,6 +33,7 @@ jobs:
           node --check src/node.js
           node --check src/ledger.js
           node --check src/gateway.js
+          node --check src/transport/websocket.js
 
       - name: Run npm test
         run: npm test

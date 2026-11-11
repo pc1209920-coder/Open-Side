@@ -78,12 +78,15 @@ Open-Side/
 │   ├── sandbox.js             # Elastic standby worker pool, AST pre-validation, VM sandbox
 │   ├── node.js                # Native node:net P2P transport, v8 binary framing & IPC fallback
 │   ├── ledger.js              # Anti-replay Proof-of-Compute economic credit ledger
-│   └── gateway.js             # Drop-in AI/Agent HTTP Gateway on port 8080
+│   ├── gateway.js             # Drop-in AI/Agent HTTP Gateway on port 8080
+│   └── transport/
+│       └── websocket.js       # Native RFC 6455 WebSocket transport client & server
 ├── test/
 │   ├── mesh.test.js           # Core protocol invariants, cryptography, telemetry & routing tests
 │   ├── m4_sandbox.test.js     # Sandbox isolation, AST validation, OOM & determinism tests
 │   ├── m5_node.test.js        # Live P2P loopback/IPC transport & wire framing tests
 │   ├── m6_ledger_e2e.test.js  # Economic ledger & full end-to-end ComputeSea tests
+│   ├── milestone2.test.js     # WebSocket transport, 5s heartbeat/15s dead-peer & graceful teardown tests
 │   ├── phase1_refinements.test.js # Audited phase 1 regression tests
 │   └── phase2_features.test.js    # Elastic pool, v8 wire protocol & AI gateway tests
 ├── package.json               # CommonJS, zero external dependencies
