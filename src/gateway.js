@@ -67,7 +67,11 @@ class OpenSideGateway {
 
     return new Promise((resolve, reject) => {
       const srv = http.createServer((req, res) => {
-        this._handleRequest(req, res);
+        this._handleRequest(req, res).catch(() => {
+          if (!res.headersSent && !res.writableEnded) {
+            this._sendError(res, 500, 'Internal server error', 'api_error');
+          }
+        });
       });
 
       srv.on('error', (err) => {
@@ -141,17 +145,24 @@ class OpenSideGateway {
 
   _readBody(req) {
     return new Promise((resolve, reject) => {
+      let isOverLimit = false;
       const chunks = [];
       let total = 0;
       req.on('data', (chunk) => {
+        if (isOverLimit) return;
         total += chunk.length;
         if (total > MAX_BODY_SIZE) {
-          req.destroy(new Error('Payload too large'));
+          isOverLimit = true;
+          const err = new RangeError('Payload Too Large: request body exceeds maximum allowed size (2MB)');
+          err.statusCode = 413;
+          reject(err);
+          req.destroy();
           return;
         }
         chunks.push(chunk);
       });
       req.on('end', () => {
+        if (isOverLimit) return;
         try {
           const raw = Buffer.concat(chunks).toString('utf8');
           if (!raw.trim()) {
@@ -165,6 +176,7 @@ class OpenSideGateway {
         }
       });
       req.on('error', (err) => {
+        if (isOverLimit) return;
         reject(err);
       });
     });
@@ -177,8 +189,11 @@ class OpenSideGateway {
       this._sendError(res, 401, 'Missing Authorization header or x-api-key', 'authentication_error');
       return false;
     }
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : String(authHeader).trim();
-    if (token !== this.apiKey) {
+    const headerStr = String(authHeader).trim();
+    const token = /^bearer\s+/i.test(headerStr) ? headerStr.replace(/^bearer\s+/i, '').trim() : headerStr;
+    const tokenBuf = Buffer.from(token);
+    const keyBuf = Buffer.from(this.apiKey);
+    if (tokenBuf.length !== keyBuf.length || !crypto.timingSafeEqual(tokenBuf, keyBuf)) {
       this._sendError(res, 401, 'Invalid API Key', 'authentication_error');
       return false;
     }
@@ -198,7 +213,12 @@ class OpenSideGateway {
       return;
     }
 
-    const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    } catch {
+      return this._sendError(res, 400, 'Invalid request URL or host header', 'invalid_request_error');
+    }
     const pathname = parsedUrl.pathname;
 
     // Health check
@@ -208,7 +228,7 @@ class OpenSideGateway {
         : null;
       return this._sendJson(res, 200, {
         status: 'ok',
-        version: '0.5.0',
+        version: '0.6.0',
         protocol: 'open-side-protocol',
         nodeId: this.sea ? this.sea.nodeId : null,
         telemetry
@@ -264,12 +284,19 @@ class OpenSideGateway {
     try {
       body = await this._readBody(req);
     } catch (err) {
-      return this._sendError(res, 400, err.message, 'invalid_request_error');
+      const code = err.statusCode || 400;
+      return this._sendError(res, code, err.message, code === 413 ? 'request_entity_too_large' : 'invalid_request_error');
     }
 
     const { messages, model = 'open-side-sea', temperature = 0.7, max_tokens } = body;
     if (!Array.isArray(messages) || messages.length === 0) {
       return this._sendError(res, 400, "Missing or invalid 'messages' array in request body", 'invalid_request_error');
+    }
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      if (!m || typeof m !== 'object') {
+        return this._sendError(res, 400, `Invalid message at index ${i}: must be a non-null object`, 'invalid_request_error');
+      }
     }
 
     // Map input messages into ComputeSea workload partition
@@ -316,9 +343,9 @@ class OpenSideGateway {
           }
         ],
         usage: {
-          prompt_tokens: messages.reduce((acc, m) => acc + (typeof m.content === 'string' ? m.content.split(/\s+/).length : 0), 0),
-          completion_tokens: responseText.split(/\s+/).length,
-          total_tokens: messages.reduce((acc, m) => acc + (typeof m.content === 'string' ? m.content.split(/\s+/).length : 0), 0) + responseText.split(/\s+/).length
+          prompt_tokens: messages.reduce((acc, m) => acc + (m && typeof m.content === 'string' ? m.content.split(/\s+/).filter(Boolean).length : 0), 0),
+          completion_tokens: responseText.split(/\s+/).filter(Boolean).length,
+          total_tokens: messages.reduce((acc, m) => acc + (m && typeof m.content === 'string' ? m.content.split(/\s+/).filter(Boolean).length : 0), 0) + responseText.split(/\s+/).filter(Boolean).length
         },
         compute_sea: {
           workloadId: seaResult.workloadId,
@@ -338,7 +365,8 @@ class OpenSideGateway {
     try {
       body = await this._readBody(req);
     } catch (err) {
-      return this._sendError(res, 400, err.message, 'invalid_request_error');
+      const code = err.statusCode || 400;
+      return this._sendError(res, code, err.message, code === 413 ? 'request_entity_too_large' : 'invalid_request_error');
     }
 
     const { input, model = 'open-side-embeddings' } = body;
@@ -356,15 +384,20 @@ class OpenSideGateway {
       // Computes deterministic normalized vector representations across Compute Sea shards
       return data.map((text, idx) => {
         const str = String(text);
-        const vec = [];
         const dim = 16;
+        let sumSq = 0;
+        const raw = [];
         for (let d = 0; d < dim; d++) {
           let sum = 0;
           for (let i = 0; i < str.length; i++) {
             sum += (str.charCodeAt(i) * (d + 1) * 31) % 1000;
           }
-          vec.push(Number((sum / 1000).toFixed(6)));
+          const val = sum / 1000;
+          raw.push(val);
+          sumSq += val * val;
         }
+        const norm = Math.sqrt(sumSq) || 1;
+        const vec = raw.map(v => Number((v / norm).toFixed(6)));
         return { index: idx, embedding: vec };
       });
     `;

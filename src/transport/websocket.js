@@ -4,7 +4,7 @@ const https = require('node:https');
 const crypto = require('node:crypto');
 const { URL } = require('node:url');
 
-const WS_GUID = '235EA68F-402E-252D-8943-FB0F868E0CD1';
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
 const OPCODES = {
   CONTINUATION: 0x0,
@@ -234,10 +234,11 @@ class FrameParser {
         }
 
         if (this.currentFrame.payloadLength > this.maxPayloadLength) {
+          const payloadLen = this.currentFrame.payloadLength;
           this.buffer = Buffer.alloc(0);
           this.state = 0;
           this.currentFrame = null;
-          const err = new RangeError(`WebSocket payload size ${this.currentFrame.payloadLength} exceeds limit ${this.maxPayloadLength}`);
+          const err = new RangeError(`WebSocket payload size ${payloadLen} exceeds limit ${this.maxPayloadLength}`);
           err.code = 1009;
           throw err;
         }
