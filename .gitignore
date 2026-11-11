@@ -1,4 +1,12 @@
 .agents/
 open_side_project_context.md
-
 *.log
+*.pid
+.DS_Store
+Thumbs.db
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.nyc_output/
+coverage/

@@ -33,6 +33,10 @@ jobs:
           node --check src/node.js
           node --check src/ledger.js
           node --check src/gateway.js
+          node --check src/checkpoint.js
+          node --check src/dht.js
+          node --check src/wasm.js
+          node --check src/daemon.js
           node --check src/transport/websocket.js
 
       - name: Run npm test

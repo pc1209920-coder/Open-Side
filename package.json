@@ -1,11 +1,13 @@
 {
   "name": "open-side-protocol",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Hardware-agnostic, zero-dependency decentralized P2P standby compute grid (Single Compute Sea protocol) pooling idle hardware for distributed task execution.",
   "main": "src/index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node src/index.js",
+    "daemon": "node src/daemon.js",
+    "gateway": "node -e \"const { OpenSideGateway } = require('./src/index'); new OpenSideGateway().start();\"",
     "test": "node --test"
   },
   "keywords": [
@@ -18,7 +20,11 @@
     "single-compute-sea",
     "ecdh",
     "hkdf-sha512",
-    "proof-of-compute"
+    "proof-of-compute",
+    "kademlia-dht",
+    "webassembly",
+    "wasm",
+    "ai-gateway"
   ],
   "author": "pc1209920-coder",
   "license": "MIT",

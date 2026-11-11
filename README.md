@@ -2,9 +2,10 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18.0.0-green.svg)](https://nodejs.org/)
-[![Architecture](https://img.shields.io/badge/Architecture-Single%20Compute%20Sea%20v0.5-purple.svg)]()
+[![Architecture](https://img.shields.io/badge/Architecture-Single%20Compute%20Sea%20v0.6-purple.svg)]()
 [![Security](https://img.shields.io/badge/Crypto-ECDH%20%2B%20HKDF--SHA512%20%2B%20AES--256--GCM-red.svg)]()
 [![Roadmap](https://img.shields.io/badge/Roadmap-ROADMAP.md-blueviolet.svg)](./ROADMAP.md)
+[![Zero-Dependency](https://img.shields.io/badge/Dependencies-0%20Zero-brightgreen.svg)]()
 
 **Open-Side** implements the **Single Compute Sea** universal protocol standard: a hardware-agnostic, zero-dependency decentralized peer-to-peer (P2P) compute backbone that pools idle standby hardware into a zero-trust, encrypted execution mesh built exclusively on native Node.js core APIs (`node:crypto`, `node:vm`, `node:worker_threads`, `node:net`, `node:os`, `node:events`, `node:v8`, `node:http`, `node:test`, `node:assert`).
 
@@ -62,6 +63,25 @@ graph TD
    - OpenAI and Anthropic-compatible local HTTP gateway server (port 8080 or IPC named pipe) routing requests directly into the Compute Sea mesh.
    - Implements `POST /v1/chat/completions` (chat inference routing & execution tracking), `POST /v1/embeddings` (distributed embedding vector generation), `GET /v1/models`, and `GET /health` with optional Bearer token auth (`apiKey`).
 
+8. **Periodic Checkpoint & State Resumption (`src/checkpoint.js` — `CheckpointManager`)**
+   - Implements structured state serialization via native `node:v8` with automatic SHA-256 integrity digests over monotonic sequence indices.
+   - Automatically handles periodic snapshotting, LRU eviction of old checkpoints, and fail-closed state restoration for interrupted or failed shards.
+   - Seamlessly integrated with `GridRouter` to resume in-flight work when peers fail or disconnect.
+
+9. **P2P Auto-Discovery & Kademlia DHT (`src/dht.js` — `KademliaDHT`, `RoutingTable`, `KBucket`)**
+   - Implements a 160-bit XOR distance metric across 20-byte Node IDs, satisfying symmetry and the triangle inequality.
+   - Features 160 $k$-buckets ($k=20$, $\alpha=3$) with LRU eviction and duplicate updates.
+   - Provides distributed key-value storage (`PING`, `STORE`, `FIND_NODE`, `FIND_VALUE`), iterative lookup, and automatic network bootstrapping.
+
+10. **WASM Runtime Engine (`src/wasm.js` — `WasmEngine`)**
+    - High-performance, sandboxed WebAssembly execution with strict capability sandboxing (no ambient OS access).
+    - Hard memory bounding via `WebAssembly.Memory` page limits and millisecond execution timeout guards.
+    - Zero-dependency synthetic WASM generation for deterministic micro-benchmarking and test verification.
+
+11. **Headless Daemon & Cluster Orchestrator (`src/daemon.js` — `DaemonMaster`)**
+    - Production-grade OS daemon with atomic PID file tracking, rotating log streams, and OS service signal handling (`SIGTERM`/`SIGINT`).
+    - Native `node:cluster` multi-process orchestrator unlocking 100% multi-core CPU task parallelism with automatic worker self-healing.
+
 ---
 
 ## 📁 Repository Layout
@@ -69,7 +89,7 @@ graph TD
 ```text
 Open-Side/
 ├── .github/
-│   └── workflows/ci.yml       # Syntax checks (all 7 modules), tests, simulation
+│   └── workflows/ci.yml       # Syntax checks (all modules), tests, simulation
 ├── ROADMAP.md                 # Full protocol development roadmap
 ├── src/
 │   ├── index.js               # Unified ComputeSea API & simulation entrypoint
@@ -79,6 +99,10 @@ Open-Side/
 │   ├── node.js                # Native node:net P2P transport, v8 binary framing & IPC fallback
 │   ├── ledger.js              # Anti-replay Proof-of-Compute economic credit ledger
 │   ├── gateway.js             # Drop-in AI/Agent HTTP Gateway on port 8080
+│   ├── checkpoint.js          # Checkpoint & state resumption engine with SHA-256 integrity
+│   ├── dht.js                 # P2P auto-discovery & Kademlia distributed hash table
+│   ├── wasm.js                # Sandboxed WebAssembly compute engine
+│   ├── daemon.js              # Multi-process cluster orchestrator & headless daemon
 │   └── transport/
 │       └── websocket.js       # Native RFC 6455 WebSocket transport client & server
 ├── test/
@@ -87,8 +111,12 @@ Open-Side/
 │   ├── m5_node.test.js        # Live P2P loopback/IPC transport & wire framing tests
 │   ├── m6_ledger_e2e.test.js  # Economic ledger & full end-to-end ComputeSea tests
 │   ├── milestone2.test.js     # WebSocket transport, 5s heartbeat/15s dead-peer & graceful teardown tests
+│   ├── milestone3.test.js     # Multi-core cluster & daemon test suite
 │   ├── phase1_refinements.test.js # Audited phase 1 regression tests
-│   └── phase2_features.test.js    # Elastic pool, v8 wire protocol & AI gateway tests
+│   ├── phase2_features.test.js    # Elastic pool, v8 wire protocol & AI gateway tests
+│   ├── checkpoint.test.js     # Checkpoint serialization, verification & router integration tests
+│   ├── dht.test.js            # XOR distance metric, k-buckets & distributed network tests
+│   └── wasm.test.js           # WebAssembly memory bounds, execution & timeout tests
 ├── package.json               # CommonJS, zero external dependencies
 ├── README.md
 └── SECURITY.md

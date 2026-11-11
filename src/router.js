@@ -1,5 +1,6 @@
 const crypto = require('node:crypto');
 const EventEmitter = require('node:events');
+const { CheckpointManager } = require('./checkpoint');
 
 const DEFAULT_MAX_CPU_THRESHOLD = 0.25;
 const DEFAULT_MIN_FREE_MEM_RATIO = 0.10;
@@ -160,6 +161,8 @@ class GridRouter extends EventEmitter {
     this.inFlightShards = new Map();
     this.failedTasks = [];
     this.expiredTasks = [];
+
+    this.checkpoints = opts.checkpointManager || new CheckpointManager();
 
     this._cpuShedActive = false;
     this._cpuHealthyStreak = 0;
@@ -999,10 +1002,21 @@ class GridRouter extends EventEmitter {
       return { status: 'FAILED', ...failure };
     }
 
+    // Check if there is an existing checkpoint to resume from
+    let resumeCheckpoint = null;
+    if (this.checkpoints) {
+      try {
+        resumeCheckpoint = this.checkpoints.restoreCheckpoint(shardId);
+      } catch (err) {
+        this.emit('checkpointCorruptedOnReschedule', { shardId, error: err.message });
+      }
+    }
+
     const updatedShard = {
       ...entry.shard,
       attempts: effectiveAttempts,
-      enqueuedAt: this._now()
+      enqueuedAt: this._now(),
+      resumeCheckpoint: resumeCheckpoint || entry.shard.resumeCheckpoint || null
     };
 
     this.pruneExpiredQueue();

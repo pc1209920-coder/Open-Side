@@ -2141,6 +2141,9 @@ if (require.main === module) {
 }
 
 const { OpenSideGateway } = require('./gateway');
+const { CheckpointManager } = require('./checkpoint');
+const { KademliaDHT, RoutingTable, KBucket, xorDistance } = require('./dht');
+const { WasmEngine, isValidWasmHeader, createMinimalAddWasm } = require('./wasm');
 const {
   WebSocketConnection,
   WebSocketServer,
@@ -2151,6 +2154,14 @@ module.exports = {
   ComputeSea,
   OpenSideProtocol,
   OpenSideGateway,
+  CheckpointManager,
+  KademliaDHT,
+  RoutingTable,
+  KBucket,
+  xorDistance,
+  WasmEngine,
+  isValidWasmHeader,
+  createMinimalAddWasm,
   WebSocketConnection,
   WebSocketServer,
   WebSocketClient,
