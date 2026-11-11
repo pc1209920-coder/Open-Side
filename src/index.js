@@ -167,6 +167,14 @@ class ComputeSea extends EventEmitter {
     this._closing = false;
     this._peerEpochMutexes = new Map();
 
+    this._teardownGracePeriodMs = typeof options.teardownGracePeriodMs === 'number' && Number.isFinite(options.teardownGracePeriodMs) && options.teardownGracePeriodMs > 0
+      ? options.teardownGracePeriodMs
+      : 5000;
+    this._teardownSignalHandlers = [];
+    if (options.handleSignals !== false) {
+      this._registerSignalHandlers();
+    }
+
     this._bindRouterEvents();
     if (this.p2pNode && typeof this.p2pNode.on === 'function') {
       this.p2pNode.on('peerDisconnected', (peerId) => {
@@ -1879,7 +1887,63 @@ class ComputeSea extends EventEmitter {
     return true;
   }
 
+  _registerSignalHandlers() {
+    const handleSignal = (sig) => {
+      this.gracefulTeardown(this._teardownGracePeriodMs, sig).catch((err) => {
+        this.emit('error', err);
+      });
+    };
+    const sigint = () => handleSignal('SIGINT');
+    const sigterm = () => handleSignal('SIGTERM');
+
+    process.once('SIGINT', sigint);
+    process.once('SIGTERM', sigterm);
+
+    this._teardownSignalHandlers.push({ signal: 'SIGINT', fn: sigint }, { signal: 'SIGTERM', fn: sigterm });
+  }
+
+  _unregisterSignalHandlers() {
+    for (const { signal, fn } of this._teardownSignalHandlers) {
+      process.removeListener(signal, fn);
+    }
+    this._teardownSignalHandlers = [];
+  }
+
+  /**
+   * Graceful Teardown:
+   * Drains active shards within a grace period before closing sockets and terminating workers.
+   * @param {number} [gracePeriodMs]
+   * @param {string} [signal]
+   * @returns {Promise<{ drained: boolean, remainingShards: number }>}
+   */
+  async gracefulTeardown(gracePeriodMs = this._teardownGracePeriodMs, signal = 'MANUAL') {
+    if (this._closed) {
+      return { drained: true, remainingShards: 0 };
+    }
+    this._closing = true;
+    this.emit('teardownStart', { signal, gracePeriodMs });
+
+    // 1. Drain active shards within grace period
+    const startTime = Date.now();
+    let remaining = this.router.inFlightShards.size;
+
+    while (remaining > 0 && Date.now() - startTime < gracePeriodMs) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      remaining = this.router.inFlightShards.size;
+    }
+
+    const drained = remaining === 0;
+    this.emit('teardownDrained', { drained, remainingShards: remaining });
+
+    // 2. Close sea, sockets, and terminate workers
+    await this.close();
+
+    this.emit('teardownComplete', { drained, signal });
+    return { drained, remainingShards: remaining };
+  }
+
   async close() {
+    this._unregisterSignalHandlers();
     this._closed = true;
     this._closing = true;
 
@@ -2077,11 +2141,19 @@ if (require.main === module) {
 }
 
 const { OpenSideGateway } = require('./gateway');
+const {
+  WebSocketConnection,
+  WebSocketServer,
+  WebSocketClient
+} = require('./transport/websocket');
 
 module.exports = {
   ComputeSea,
   OpenSideProtocol,
   OpenSideGateway,
+  WebSocketConnection,
+  WebSocketServer,
+  WebSocketClient,
   runProtocolSimulation,
   runFullSeaSimulation
 };

@@ -10,6 +10,8 @@ const DEFAULT_MAX_QUEUE_SIZE = 1000;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_MAX_QUEUE_TIME_MS = 60000;
 const DEFAULT_TELEMETRY_CACHE_TTL_MS = 10;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 5000;
+const DEFAULT_DEAD_PEER_TIMEOUT_MS = 15000;
 
 function readTickValue(val) {
   if (val === undefined) {
@@ -136,6 +138,23 @@ class GridRouter extends EventEmitter {
       this.telemetryCacheTtlMs = 0;
     }
 
+    this.heartbeatIntervalMs = opts.heartbeatIntervalMs !== undefined
+      ? opts.heartbeatIntervalMs
+      : DEFAULT_HEARTBEAT_INTERVAL_MS;
+    if (typeof this.heartbeatIntervalMs !== 'number' || !Number.isFinite(this.heartbeatIntervalMs) || this.heartbeatIntervalMs <= 0) {
+      throw new RangeError('Invalid heartbeatIntervalMs: must be a positive finite number');
+    }
+
+    this.deadPeerTimeoutMs = opts.deadPeerTimeoutMs !== undefined
+      ? opts.deadPeerTimeoutMs
+      : DEFAULT_DEAD_PEER_TIMEOUT_MS;
+    if (typeof this.deadPeerTimeoutMs !== 'number' || !Number.isFinite(this.deadPeerTimeoutMs) || this.deadPeerTimeoutMs <= 0) {
+      throw new RangeError('Invalid deadPeerTimeoutMs: must be a positive finite number');
+    }
+
+    this._onHeartbeatPing = typeof opts.onHeartbeatPing === 'function' ? opts.onHeartbeatPing : null;
+    this._heartbeatTimer = null;
+
     this.peerTable = new Map();
     this.taskQueue = [];
     this.inFlightShards = new Map();
@@ -149,6 +168,10 @@ class GridRouter extends EventEmitter {
     this._cachedTelemetry = null;
     this._cachedAt = null;
     this._prevCpuSnapshot = this._captureCpuSnapshotSafe();
+
+    if (opts.autoStartHeartbeat) {
+      this.startHeartbeatMonitor();
+    }
   }
 
   _getOs() {
@@ -657,6 +680,99 @@ class GridRouter extends EventEmitter {
       this.flushQueue();
     }
     return peer;
+  }
+
+  /**
+   * Sets the callback invoked when a heartbeat ping should be transmitted to a peer.
+   * @param {function(string, object): void} fn
+   */
+  setHeartbeatPingHandler(fn) {
+    if (fn !== null && typeof fn !== 'function') {
+      throw new TypeError('Heartbeat ping handler must be a function or null');
+    }
+    this._onHeartbeatPing = fn;
+  }
+
+  /**
+   * Starts periodic 5-second heartbeat pinging and dead peer detection (15s default).
+   * @param {number} [intervalMs]
+   */
+  startHeartbeatMonitor(intervalMs = this.heartbeatIntervalMs) {
+    if (this._heartbeatTimer) return;
+    this.heartbeatIntervalMs = intervalMs;
+    this._heartbeatTimer = setInterval(() => {
+      this.checkHeartbeats();
+    }, this.heartbeatIntervalMs);
+    if (typeof this._heartbeatTimer.unref === 'function') {
+      this._heartbeatTimer.unref();
+    }
+  }
+
+  /**
+   * Stops the periodic heartbeat monitor.
+   */
+  stopHeartbeatMonitor() {
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
+  }
+
+  /**
+   * Records a heartbeat pong received from a peer, updating its lastSeen timestamp
+   * and optionally refreshing telemetry.
+   * @param {string} peerNodeId
+   * @param {object} [telemetry]
+   */
+  recordHeartbeatPong(peerNodeId, telemetry = null) {
+    const peer = this.peerTable.get(peerNodeId);
+    if (!peer) return false;
+    peer.lastSeen = this._now();
+    if (telemetry && typeof telemetry === 'object') {
+      this.updatePeerTelemetry(peerNodeId, telemetry);
+    }
+    this.emit('peerHeartbeat', { peerId: peerNodeId, lastSeen: peer.lastSeen });
+    return true;
+  }
+
+  /**
+   * Inspects all registered peers, sends heartbeat pings for live peers,
+   * detects dead peers (exceeding deadPeerTimeoutMs), marks them disconnected,
+   * and instantly re-queues and re-dispatches their in-flight shards to another node.
+   * @returns {{ deadPeers: Array<string>, pingedPeers: Array<string>, redispatched: Array<object> }}
+   */
+  checkHeartbeats() {
+    const now = this._now();
+    const deadPeers = [];
+    const pingedPeers = [];
+    const redispatched = [];
+
+    for (const [peerId, peer] of Array.from(this.peerTable.entries())) {
+      const elapsed = now - (peer.lastSeen || 0);
+      if (elapsed > this.deadPeerTimeoutMs) {
+        deadPeers.push(peerId);
+      } else {
+        pingedPeers.push(peerId);
+        if (this._onHeartbeatPing) {
+          try {
+            this._onHeartbeatPing(peerId, peer);
+          } catch {
+            // Heartbeat ping transmission failure handled cleanly
+          }
+        }
+        this.emit('heartbeatPing', { peerId, peer });
+      }
+    }
+
+    for (const deadPeerId of deadPeers) {
+      this.emit('deadPeerDetected', { peerId: deadPeerId });
+      const { rescheduled } = this.handlePeerDisconnect(deadPeerId);
+      for (const s of rescheduled) {
+        redispatched.push(s);
+      }
+    }
+
+    return { deadPeers, pingedPeers, redispatched };
   }
 
   /**
