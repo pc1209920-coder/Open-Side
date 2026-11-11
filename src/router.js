@@ -642,6 +642,10 @@ class GridRouter extends EventEmitter {
 
     this.peerTable.set(peerNodeId, peerInfo);
 
+    if (telemetry && telemetry.reputationScore !== undefined) {
+      this.updatePeerReputation(peerNodeId, telemetry.reputationScore);
+    }
+
     if (peerInfo.standbyReady && this.autoFlush && this.taskQueue.length > 0) {
       this.flushQueue();
     }
@@ -677,11 +681,66 @@ class GridRouter extends EventEmitter {
     if (telemetry.maxConcurrentShards !== undefined && Number.isSafeInteger(telemetry.maxConcurrentShards) && telemetry.maxConcurrentShards > 0) {
       peer.maxConcurrentShards = telemetry.maxConcurrentShards;
     }
+    if (telemetry.tier !== undefined) {
+      peer.tier = telemetry.tier;
+    }
+    if (telemetry.reputationScore !== undefined) {
+      this.updatePeerReputation(peerNodeId, telemetry.reputationScore);
+    }
     peer.lastSeen = this._now();
 
     if (peer.standbyReady && this.autoFlush && this.taskQueue.length > 0) {
       this.flushQueue();
     }
+    return peer;
+  }
+
+  /**
+   * Updates peer reputation score [0.0 - 1.0] and auto-assigns tier level:
+   * Tier 1: Data Center / High Performance (Score >= 0.85, low latency, high capacity)
+   * Tier 2: Workstation / Desktop (Score >= 0.60)
+   * Tier 3: Edge / IoT / Low-RAM (Score < 0.60)
+   * @param {string} peerNodeId
+   * @param {number|object} deltaOrScore Either raw score or { success: boolean, executionTimeMs?: number }
+   * @returns {object} Updated peer
+   */
+  updatePeerReputation(peerNodeId, deltaOrScore) {
+    const peer = this.peerTable.get(peerNodeId);
+    if (!peer) {
+      throw new Error(`Unknown peer: ${peerNodeId}`);
+    }
+
+    if (peer.reputationScore === undefined) {
+      peer.reputationScore = 0.8; // Default baseline score
+    }
+
+    if (typeof deltaOrScore === 'number' && Number.isFinite(deltaOrScore)) {
+      peer.reputationScore = Math.round(Math.max(0.0, Math.min(1.0, deltaOrScore)) * 100) / 100;
+    } else if (deltaOrScore && typeof deltaOrScore === 'object') {
+      if (deltaOrScore.success) {
+        // Boost reputation on successful verified attestation
+        peer.reputationScore = Math.round(Math.min(1.0, peer.reputationScore + 0.05) * 100) / 100;
+      } else {
+        // Slash reputation on tampered result or failed verification
+        peer.reputationScore = Math.round(Math.max(0.0, peer.reputationScore - 0.25) * 100) / 100;
+      }
+    }
+
+    // Dynamic Tier Classification
+    if (peer.reputationScore >= 0.85 && (peer.capacityScore || 0) >= 80 && (peer.latencyMs || 999) < 100) {
+      peer.tier = 'TIER_1'; // High performance
+    } else if (peer.reputationScore >= 0.60) {
+      peer.tier = 'TIER_2'; // Standard desktop / workstation
+    } else {
+      peer.tier = 'TIER_3'; // Low reliability / Edge
+    }
+
+    this.emit('peerReputationUpdated', {
+      peerId: peerNodeId,
+      reputationScore: peer.reputationScore,
+      tier: peer.tier
+    });
+
     return peer;
   }
 
@@ -861,6 +920,12 @@ class GridRouter extends EventEmitter {
     };
 
     activeNodes.sort((a, b) => {
+      // Prioritize higher reputation score if available
+      const repA = a.reputationScore !== undefined ? a.reputationScore : 0.8;
+      const repB = b.reputationScore !== undefined ? b.reputationScore : 0.8;
+      if (Math.abs(repA - repB) >= 0.1) {
+        return repB - repA; // Higher reputation preferred
+      }
       if (a.latencyMs !== b.latencyMs) {
         return a.latencyMs - b.latencyMs;
       }
@@ -1294,6 +1359,85 @@ class GridRouter extends EventEmitter {
     }
 
     return sorted.map((r) => r.output);
+  }
+
+  /**
+   * Evaluates Byzantine majority consensus across redundant shard outputs.
+   * If a majority agreement exists (e.g., 2-of-3 or 2-of-2), returns the consensus output
+   * and lists consensus/dissenting peer nodes.
+   * Throws Error fail-closed if no majority consensus is achieved.
+   * @param {Array<{ output: any, peerId?: string, workerId?: string }>} executions
+   * @returns {{ consensusOutput: any, agreementRatio: number, consensusPeers: string[], dissentingPeers: string[] }}
+   */
+  evaluateConsensus(executions) {
+    if (!Array.isArray(executions) || executions.length === 0) {
+      throw new TypeError('Invalid executions: expected non-empty Array');
+    }
+
+    // Map each output to deterministic canonical serialization hash
+    const hashes = executions.map((exec) => {
+      const canonicalStr = JSON.stringify(exec.output, (_k, v) => (typeof v === 'bigint' ? `${v}n` : v));
+      const hash = crypto.createHash('sha256').update(String(canonicalStr)).digest('hex');
+      return {
+        hash,
+        exec,
+        peerId: exec.peerId || exec.workerId || 'unknown'
+      };
+    });
+
+    const frequency = new Map();
+    for (const h of hashes) {
+      const count = (frequency.get(h.hash) || 0) + 1;
+      frequency.set(h.hash, count);
+    }
+
+    let winningHash = null;
+    let maxCount = 0;
+    for (const [hash, count] of frequency.entries()) {
+      if (count > maxCount) {
+        maxCount = count;
+        winningHash = hash;
+      }
+    }
+
+    const majorityNeeded = Math.floor(executions.length / 2) + 1;
+    if (maxCount < majorityNeeded) {
+      throw new Error(`Consensus failed: largest agreement (${maxCount}/${executions.length}) did not meet majority (${majorityNeeded})`);
+    }
+
+    const consensusPeers = [];
+    const dissentingPeers = [];
+    let consensusOutput = undefined;
+
+    for (const h of hashes) {
+      if (h.hash === winningHash) {
+        consensusPeers.push(h.peerId);
+        if (consensusOutput === undefined) {
+          consensusOutput = h.exec.output;
+        }
+      } else {
+        dissentingPeers.push(h.peerId);
+      }
+    }
+
+    // Update reputation of participating peers
+    for (const peerId of consensusPeers) {
+      if (this.peerTable.has(peerId)) {
+        this.updatePeerReputation(peerId, { success: true });
+      }
+    }
+    for (const peerId of dissentingPeers) {
+      if (this.peerTable.has(peerId)) {
+        this.updatePeerReputation(peerId, { success: false });
+      }
+    }
+
+    return {
+      consensusOutput,
+      agreementRatio: maxCount / executions.length,
+      consensusPeers,
+      dissentingPeers
+    };
   }
 }
 

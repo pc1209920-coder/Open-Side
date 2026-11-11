@@ -2149,6 +2149,21 @@ const {
   WebSocketServer,
   WebSocketClient
 } = require('./transport/websocket');
+const {
+  StunClient,
+  NatTraversal,
+  UdpHolePuncher,
+  NAT_TYPE,
+  STUN_MAGIC_COOKIE,
+  STUN_MSG_TYPE,
+  STUN_ATTR_TYPE,
+  encodeStunMessage,
+  parseStunMessage,
+  encodeXorMappedAddressAttr,
+  encodeMappedAddressAttr,
+  decodeXorMappedAddress,
+  decodeMappedAddress
+} = require('./transport/nat');
 
 module.exports = {
   ComputeSea,
@@ -2165,6 +2180,19 @@ module.exports = {
   WebSocketConnection,
   WebSocketServer,
   WebSocketClient,
+  StunClient,
+  NatTraversal,
+  UdpHolePuncher,
+  NAT_TYPE,
+  STUN_MAGIC_COOKIE,
+  STUN_MSG_TYPE,
+  STUN_ATTR_TYPE,
+  encodeStunMessage,
+  parseStunMessage,
+  encodeXorMappedAddressAttr,
+  encodeMappedAddressAttr,
+  decodeXorMappedAddress,
+  decodeMappedAddress,
   runProtocolSimulation,
   runFullSeaSimulation
 };

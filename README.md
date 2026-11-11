@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18.0.0-green.svg)](https://nodejs.org/)
-[![Architecture](https://img.shields.io/badge/Architecture-Single%20Compute%20Sea%20v0.6-purple.svg)]()
+[![Architecture](https://img.shields.io/badge/Architecture-Single%20Compute%20Sea%20v1.0.0-purple.svg)]()
 [![Security](https://img.shields.io/badge/Crypto-ECDH%20%2B%20HKDF--SHA512%20%2B%20AES--256--GCM-red.svg)]()
 [![Roadmap](https://img.shields.io/badge/Roadmap-ROADMAP.md-blueviolet.svg)](./ROADMAP.md)
 [![Zero-Dependency](https://img.shields.io/badge/Dependencies-0%20Zero-brightgreen.svg)]()
@@ -82,6 +82,22 @@ graph TD
     - Production-grade OS daemon with atomic PID file tracking, rotating log streams, and OS service signal handling (`SIGTERM`/`SIGINT`).
     - Native `node:cluster` multi-process orchestrator unlocking 100% multi-core CPU task parallelism with automatic worker self-healing.
 
+12. **Multiplexed Streams & Batch Shard Pipelining (`src/node.js` — `P2PStream`, `dispatchPipelinedBatch`)**
+    - 2-byte stream framing (`STREAM_FRAME_TAG: 0x03`) and duplex stream demuxing allowing multiple concurrent shards over a single TCP connection without head-of-line blocking.
+    - Concurrent pipelined batch dispatching over the wire.
+
+13. **NAT Traversal & Zero-Dependency STUN Client (`src/transport/nat.js` — `StunClient`, `NatTraversal`, `UdpHolePuncher`)**
+    - RFC 5389 compliant STUN client over `node:dgram` with XOR-MAPPED-ADDRESS decoding across IPv4 and IPv6.
+    - Multi-server NAT mapping classifier (`FULL_CONE`, `SYMMETRIC`, `OPEN_INTERNET`) and UDP hole-punching coordination for P2P connection behind domestic firewalls.
+
+14. **Redundant Shard Dispatch & Majority Consensus Voting (`src/router.js` — `evaluateConsensus`)**
+    - Byzantine fault-tolerant majority consensus voting on redundant shard outputs (2-of-3 agreement).
+    - Automatic reputation reward for consensus participants and slashing for dissenting/faulty nodes.
+
+15. **Dynamic Tiered Scheduling & Peer Reputation (`src/router.js` — `updatePeerReputation`)**
+    - Dynamic node classification: Tier 1 (High-Performance Data Centers), Tier 2 (Workstations/Desktops), Tier 3 (Edge/Low-RAM).
+    - Reliability-weighted optimal node selection prioritizing top reputation peers.
+
 ---
 
 ## 📁 Repository Layout
@@ -104,7 +120,8 @@ Open-Side/
 │   ├── wasm.js                # Sandboxed WebAssembly compute engine
 │   ├── daemon.js              # Multi-process cluster orchestrator & headless daemon
 │   └── transport/
-│       └── websocket.js       # Native RFC 6455 WebSocket transport client & server
+│       ├── websocket.js       # Native RFC 6455 WebSocket transport client & server
+│       └── nat.js             # RFC 5389 STUN client, NAT detection & UDP hole punching
 ├── test/
 │   ├── mesh.test.js           # Core protocol invariants, cryptography, telemetry & routing tests
 │   ├── m4_sandbox.test.js     # Sandbox isolation, AST validation, OOM & determinism tests
@@ -116,7 +133,10 @@ Open-Side/
 │   ├── phase2_features.test.js    # Elastic pool, v8 wire protocol & AI gateway tests
 │   ├── checkpoint.test.js     # Checkpoint serialization, verification & router integration tests
 │   ├── dht.test.js            # XOR distance metric, k-buckets & distributed network tests
-│   └── wasm.test.js           # WebAssembly memory bounds, execution & timeout tests
+│   ├── wasm.test.js           # WebAssembly memory bounds, execution & timeout tests
+│   ├── multiplex.test.js      # Stream multiplexing & batch pipelining tests
+│   ├── nat.test.js            # RFC 5389 STUN, XOR mapping & hole punching tests
+│   └── consensus_tiering.test.js # Byzantine consensus voting & peer tiering tests
 ├── package.json               # CommonJS, zero external dependencies
 ├── README.md
 └── SECURITY.md

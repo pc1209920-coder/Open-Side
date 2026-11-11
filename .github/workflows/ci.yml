@@ -38,6 +38,7 @@ jobs:
           node --check src/wasm.js
           node --check src/daemon.js
           node --check src/transport/websocket.js
+          node --check src/transport/nat.js
 
       - name: Run npm test
         run: npm test

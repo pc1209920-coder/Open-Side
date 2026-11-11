@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
 const v8 = require('node:v8');
+const { Duplex } = require('node:stream');
 
 const { MeshCryptoEngine } = require('./crypto');
 const { StandbySandbox } = require('./sandbox');
@@ -15,6 +16,13 @@ const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5000;
 const DEFAULT_SHARD_TIMEOUT_MS = 10000;
 const DEFAULT_TIME_DRIFT_MS = 60000;
 const MAX_SEEN_HANDSHAKE_NONCES = 10000;
+
+// Multiplex stream frame flags & constants
+const STREAM_FRAME_TAG = 0x03;
+const STREAM_FLAG_DATA = 0x00;
+const STREAM_FLAG_FIN  = 0x01;
+const STREAM_FLAG_RST  = 0x02;
+const STREAM_FLAG_MSG  = 0x04;
 
 class FrameTooLargeError extends Error {
   constructor(message) {
@@ -45,6 +53,103 @@ class HandshakeTimeoutError extends Error {
     super(message);
     this.name = 'HandshakeTimeoutError';
     this.code = 'ERR_HANDSHAKE_TIMEOUT';
+  }
+}
+
+class MultiplexError extends Error {
+  constructor(message, code = 'ERR_MULTIPLEX') {
+    super(message);
+    this.name = 'MultiplexError';
+    this.code = code;
+  }
+}
+
+/**
+ * Duplex stream representing a multiplexed logical stream over a physical P2P socket.
+ */
+class P2PStream extends Duplex {
+  /**
+   * @param {object} options
+   * @param {number} options.streamId
+   * @param {P2PNode} options.node
+   * @param {net.Socket} options.socket
+   */
+  constructor(options = {}) {
+    super({ allowHalfOpen: true, ...(options.streamOptions || {}) });
+    this.streamId = options.streamId;
+    this.node = options.node;
+    this.socket = options.socket;
+    this.peerId = options.peerId || null;
+    this._remoteClosed = false;
+    this._reset = false;
+  }
+
+  _read(size) {
+    // Backpressure handled automatically by push()
+  }
+
+  _write(chunk, encoding, callback) {
+    if (this._reset || this.destroyed || !this.socket || this.socket.destroyed || !this.socket.writable) {
+      callback(new SocketDestroyedError(`Cannot write to stream ${this.streamId}: socket or stream closed`));
+      return;
+    }
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding);
+    try {
+      const frame = P2PNode.encodeStreamFrame(this.streamId, buf, STREAM_FLAG_DATA, this.node.maxFrameSize);
+      this.socket.write(frame, callback);
+    } catch (err) {
+      callback(err);
+    }
+  }
+
+  _final(callback) {
+    if (this._reset || this.destroyed || !this.socket || this.socket.destroyed || !this.socket.writable) {
+      callback();
+      return;
+    }
+    try {
+      const frame = P2PNode.encodeStreamFrame(this.streamId, Buffer.allocUnsafe(0), STREAM_FLAG_FIN, this.node.maxFrameSize);
+      this.socket.write(frame, callback);
+    } catch (err) {
+      callback(err);
+    }
+  }
+
+  /**
+   * Sends an immediate structured message or payload over this multiplexed stream.
+   * @param {any} message
+   * @returns {Promise<void>}
+   */
+  async sendMessage(message) {
+    if (this._reset || this.destroyed || !this.socket || this.socket.destroyed || !this.socket.writable) {
+      throw new SocketDestroyedError(`Cannot send message on stream ${this.streamId}: stream closed`);
+    }
+    const format = this.node && this.node.useV8Serialization ? 'v8' : 'json';
+    const frame = P2PNode.encodeStreamFrame(this.streamId, message, STREAM_FLAG_MSG, this.node.maxFrameSize, format);
+    return new Promise((resolve, reject) => {
+      this.socket.write(frame, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+  }
+
+  /**
+   * Sends an RST frame and tears down the stream immediately.
+   * @param {Error} [err]
+   */
+  reset(err) {
+    if (this._reset) return;
+    this._reset = true;
+    if (this.socket && !this.socket.destroyed && this.socket.writable) {
+      try {
+        const frame = P2PNode.encodeStreamFrame(this.streamId, Buffer.allocUnsafe(0), STREAM_FLAG_RST, this.node.maxFrameSize);
+        this.socket.write(frame);
+      } catch {
+        // Ignore write error on reset
+      }
+    }
+    this.destroy(err || new MultiplexError(`Stream ${this.streamId} reset`, 'ERR_STREAM_RESET'));
   }
 }
 
@@ -126,6 +231,7 @@ class P2PNode extends EventEmitter {
     this._listeningPromise = null;
     this._closePromise = null;
     this._closing = false;
+    this._nextStreamId = 1;
   }
 
   _now() {
@@ -191,6 +297,86 @@ class P2PNode extends EventEmitter {
 
   encodeFrame(payload, format = (this.useV8Serialization ? 'v8' : 'json')) {
     return P2PNode.encodeFrame(payload, this.maxFrameSize, format);
+  }
+
+  /**
+   * Encodes a multiplexed stream frame with 2-byte streamId and 1-byte flags.
+   * Frame wire layout:
+   * [4 bytes total payload length] [1 byte STREAM_FRAME_TAG (0x03)] [2 bytes streamId BE] [1 byte flags] [payload data]
+   * @param {number} streamId Integer 0 to 65535
+   * @param {Buffer|Uint8Array|string|object} data
+   * @param {number} [flags] STREAM_FLAG_DATA | STREAM_FLAG_FIN | STREAM_FLAG_RST | STREAM_FLAG_MSG
+   * @param {number} [maxFrameSize]
+   * @param {string} [format] 'raw' | 'json' | 'v8'
+   * @returns {Buffer}
+   */
+  static encodeStreamFrame(streamId, data = Buffer.allocUnsafe(0), flags = STREAM_FLAG_DATA, maxFrameSize = DEFAULT_MAX_FRAME_SIZE, format = 'raw') {
+    if (!Number.isSafeInteger(streamId) || streamId < 0 || streamId > 0xffff) {
+      throw new RangeError(`Invalid streamId (${streamId}): must be an integer between 0 and 65535`);
+    }
+    let payloadBuf;
+    if (Buffer.isBuffer(data)) {
+      payloadBuf = data;
+    } else if (data instanceof Uint8Array) {
+      payloadBuf = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    } else if (typeof data === 'string') {
+      payloadBuf = Buffer.from(data, 'utf8');
+    } else if (data !== undefined && data !== null && typeof data === 'object') {
+      if (format === 'v8') {
+        payloadBuf = v8.serialize(data);
+      } else {
+        payloadBuf = Buffer.from(JSON.stringify(data), 'utf8');
+      }
+    } else {
+      payloadBuf = Buffer.allocUnsafe(0);
+    }
+
+    const bodyLength = 4 + payloadBuf.length; // 1 tag + 2 streamId + 1 flags + payload
+    if (bodyLength > maxFrameSize) {
+      throw new FrameTooLargeError(`Outbound stream frame size (${bodyLength} bytes) exceeds maxFrameSize (${maxFrameSize} bytes)`);
+    }
+
+    const frame = Buffer.allocUnsafe(4 + bodyLength);
+    frame.writeUInt32BE(bodyLength, 0);
+    frame[4] = STREAM_FRAME_TAG; // 0x03
+    frame.writeUInt16BE(streamId, 5);
+    frame[7] = flags & 0xff;
+    if (payloadBuf.length > 0) {
+      payloadBuf.copy(frame, 8);
+    }
+    return frame;
+  }
+
+  encodeStreamFrame(streamId, data = Buffer.allocUnsafe(0), flags = STREAM_FLAG_DATA, format = 'raw') {
+    return P2PNode.encodeStreamFrame(streamId, data, flags, this.maxFrameSize, format);
+  }
+
+  /**
+   * Decodes a body buffer into either a control frame or a multiplexed stream frame.
+   * @param {Buffer} bodyBuf
+   * @returns {{ isStream: boolean, streamId?: number, flags?: number, data: any }}
+   */
+  static decodeWireBody(bodyBuf) {
+    if (!Buffer.isBuffer(bodyBuf)) {
+      throw new TypeError('Invalid wire body: must be a Buffer');
+    }
+    if (bodyBuf.length >= 4 && bodyBuf[0] === STREAM_FRAME_TAG) {
+      const streamId = bodyBuf.readUInt16BE(1);
+      const flags = bodyBuf.readUInt8(3);
+      const data = bodyBuf.subarray(4);
+      return { isStream: true, streamId, flags, data };
+    }
+
+    // Standard control / encrypted frames (v8 or JSON)
+    let message;
+    if (bodyBuf.length > 0 && (bodyBuf[0] === 0xff || bodyBuf[0] === 0x02)) {
+      const payloadSlice = bodyBuf[0] === 0x02 ? bodyBuf.subarray(1) : bodyBuf;
+      message = v8.deserialize(payloadSlice);
+    } else {
+      const rawSlice = (bodyBuf.length > 0 && bodyBuf[0] === 0x01) ? bodyBuf.subarray(1) : bodyBuf;
+      message = JSON.parse(rawSlice.toString('utf8'));
+    }
+    return { isStream: false, data: message };
   }
 
   _generateIpcPath() {
@@ -479,6 +665,7 @@ class P2PNode extends EventEmitter {
       pendingHandshake: null,
       inboundAuthTimer: null,
       closed: false,
+      streams: new Map(),
       parser: {
         chunks: [],
         totalBytes: 0,
@@ -587,6 +774,15 @@ class P2PNode extends EventEmitter {
       const bodyBuf = this._readExactFromParser(parser, parser.expectedLength);
       parser.expectedLength = null;
 
+      // Check for multiplexed stream frame (format tag 0x03)
+      if (bodyBuf.length >= 4 && bodyBuf[0] === STREAM_FRAME_TAG) {
+        const streamId = bodyBuf.readUInt16BE(1);
+        const flags = bodyBuf.readUInt8(3);
+        const payloadData = bodyBuf.subarray(4);
+        this._handleStreamFrame(socket, meta, streamId, flags, payloadData);
+        continue;
+      }
+
       let message;
       try {
         if (bodyBuf.length > 0 && (bodyBuf[0] === 0xff || bodyBuf[0] === 0x02)) {
@@ -667,6 +863,15 @@ class P2PNode extends EventEmitter {
       pending.reject(new SocketDestroyedError('Socket closed before handshake completed'));
     }
 
+    if (meta.streams) {
+      for (const stream of meta.streams.values()) {
+        if (!stream.destroyed) {
+          stream.destroy();
+        }
+      }
+      meta.streams.clear();
+    }
+
     this._sockets.delete(socket);
 
     const peerId = meta.peerId;
@@ -720,6 +925,125 @@ class P2PNode extends EventEmitter {
         this.emit('peerDisconnected', { peerId, socket });
       }
     }
+  }
+
+  _handleStreamFrame(socket, meta, streamId, flags, payloadData) {
+    if (meta.closed || socket.destroyed) return;
+
+    let stream = meta.streams.get(streamId);
+    if (!stream) {
+      if (flags & STREAM_FLAG_RST) {
+        // Stream already gone or reset, ignore
+        return;
+      }
+      // Allocate inbound P2PStream
+      stream = new P2PStream({
+        streamId,
+        node: this,
+        socket,
+        peerId: meta.peerId
+      });
+      meta.streams.set(streamId, stream);
+      stream.on('close', () => {
+        if (meta.streams.get(streamId) === stream) {
+          meta.streams.delete(streamId);
+        }
+      });
+      this.emit('stream', stream, { peerId: meta.peerId, socket, streamId });
+    }
+
+    if (flags & STREAM_FLAG_RST) {
+      stream._reset = true;
+      meta.streams.delete(streamId);
+      stream.destroy(new MultiplexError(`Stream ${streamId} reset by remote peer`, 'ERR_STREAM_RESET'));
+      return;
+    }
+
+    if (flags & STREAM_FLAG_MSG) {
+      // Decode structured message
+      let parsed = null;
+      try {
+        if (payloadData.length > 0 && (payloadData[0] === 0xff || payloadData[0] === 0x02)) {
+          const slice = payloadData[0] === 0x02 ? payloadData.subarray(1) : payloadData;
+          parsed = v8.deserialize(slice);
+        } else {
+          parsed = JSON.parse(payloadData.toString('utf8'));
+        }
+      } catch {
+        parsed = payloadData;
+      }
+      stream.emit('message', parsed);
+      this.emit('streamMessage', { streamId, data: parsed, peerId: meta.peerId, socket });
+    } else if (payloadData.length > 0) {
+      stream.push(payloadData);
+    }
+
+    if (flags & STREAM_FLAG_FIN) {
+      stream._remoteClosed = true;
+      stream.push(null);
+    }
+  }
+
+  /**
+   * Creates or allocates a new multiplexed logical duplex stream over an existing connection.
+   * @param {string | net.Socket} peerIdOrSocket
+   * @param {object} [options]
+   * @param {number} [options.streamId] Explicit stream ID (0-65535) or auto-assigned
+   * @returns {P2PStream}
+   */
+  createStream(peerIdOrSocket, options = {}) {
+    if (this._closing) {
+      throw new Error('Cannot create stream: node is closing');
+    }
+    const resolved = this._resolvePeerTarget(peerIdOrSocket);
+    if (resolved.error) {
+      throw resolved.error;
+    }
+    const { peerId, socket } = resolved;
+    const meta = this._socketMeta.get(socket);
+    if (!meta || meta.closed || !socket || socket.destroyed || !socket.writable) {
+      throw new SocketDestroyedError(`Cannot create stream on disconnected peer or socket`);
+    }
+
+    let streamId = options.streamId;
+    if (streamId !== undefined) {
+      if (!Number.isSafeInteger(streamId) || streamId < 0 || streamId > 0xffff) {
+        throw new RangeError(`Invalid streamId (${streamId}): must be an integer between 0 and 65535`);
+      }
+      if (meta.streams.has(streamId)) {
+        throw new MultiplexError(`Stream ID ${streamId} already active on this socket`, 'ERR_STREAM_EXISTS');
+      }
+    } else {
+      // Auto-assign next odd (for initiator) or next free streamId
+      let candidate = (this._nextStreamId % 65534) + 1;
+      let attempts = 0;
+      while (meta.streams.has(candidate) && attempts < 65535) {
+        candidate = (candidate % 65534) + 1;
+        attempts++;
+      }
+      if (attempts >= 65535) {
+        throw new MultiplexError('Exhausted stream ID space on connection', 'ERR_STREAM_EXHAUSTED');
+      }
+      this._nextStreamId = (candidate % 65534) + 1;
+      streamId = candidate;
+    }
+
+    const stream = new P2PStream({
+      streamId,
+      node: this,
+      socket,
+      peerId,
+      streamOptions: options
+    });
+
+    meta.streams.set(streamId, stream);
+    stream.on('close', () => {
+      if (meta.streams.get(streamId) === stream) {
+        meta.streams.delete(streamId);
+      }
+    });
+
+    return stream;
   }
 
   _writeFrame(socket, payload) {
@@ -1840,10 +2164,41 @@ class P2PNode extends EventEmitter {
 
     return this._closePromise;
   }
+
+  /**
+   * Pipelined Shard Dispatching:
+   * Dispatches multiple shards in parallel over the wire without blocking sequentially.
+   * Shards fly concurrently and results are resolved as they complete.
+   * @param {string|net.Socket} peerIdOrSocket
+   * @param {Array<object>} shards Array of shard objects { shardId, taskCode, inputData, ... }
+   * @param {object} [options] Options passed to sendShard (timeoutMs, etc.)
+   * @returns {Promise<Array<object>>} Resolves with array of execution outputs in order of input shards
+   */
+  async dispatchPipelinedBatch(peerIdOrSocket, shards, options = {}) {
+    if (!Array.isArray(shards)) {
+      throw new TypeError('Invalid shards: must be an Array');
+    }
+    if (shards.length === 0) {
+      return [];
+    }
+
+    const promises = shards.map((shard) => {
+      return this.dispatchRemoteShard(peerIdOrSocket, shard, options);
+    });
+
+    return Promise.all(promises);
+  }
 }
 
 module.exports = {
   P2PNode,
+  P2PStream,
+  MultiplexError,
+  STREAM_FRAME_TAG,
+  STREAM_FLAG_DATA,
+  STREAM_FLAG_FIN,
+  STREAM_FLAG_RST,
+  STREAM_FLAG_MSG,
   FrameTooLargeError,
   SocketDestroyedError,
   AlreadyListeningError,
