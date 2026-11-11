@@ -1,0 +1,44 @@
+name: Open-Side CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: ['20', '22']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Verify zero external dependencies
+        run: node -e "const pkg = require('./package.json'); if (Object.keys(pkg.dependencies || {}).length || Object.keys(pkg.devDependencies || {}).length) process.exit(1);"
+
+      - name: Check syntax across all 7 modules
+        run: |
+          node --check src/index.js
+          node --check src/crypto.js
+          node --check src/sandbox.js
+          node --check src/router.js
+          node --check src/node.js
+          node --check src/ledger.js
+          node --check src/gateway.js
+
+      - name: Run npm test
+        run: npm test
+
+      - name: Run node --test
+        run: node --test
+
+      - name: Run simulation
+        run: npm start

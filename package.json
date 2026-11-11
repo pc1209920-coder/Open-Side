@@ -1,0 +1,28 @@
+{
+  "name": "open-side-protocol",
+  "version": "0.5.0",
+  "description": "Hardware-agnostic, zero-dependency decentralized P2P standby compute grid (Single Compute Sea protocol) pooling idle hardware for distributed task execution.",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "grid-computing",
+    "distributed-systems",
+    "edge-computing",
+    "p2p-mesh",
+    "standby-compute",
+    "zero-trust-sandbox",
+    "single-compute-sea",
+    "ecdh",
+    "hkdf-sha512",
+    "proof-of-compute"
+  ],
+  "author": "pc1209920-coder",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
