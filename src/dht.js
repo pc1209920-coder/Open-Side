@@ -70,16 +70,19 @@ function normalizeNodeId(rawId) {
  * @returns {number}
  */
 function getBucketIndex(localId, targetId) {
-  const dist = xorDistance(localId, targetId);
+  if (!Buffer.isBuffer(localId) || !Buffer.isBuffer(targetId)) {
+    throw new TypeError('Node IDs for XOR distance must be Buffers');
+  }
+  if (localId.length !== ID_BYTES || targetId.length !== ID_BYTES) {
+    throw new RangeError(`Node IDs must be exactly ${ID_BYTES} bytes (${ID_BITS} bits)`);
+  }
+
   for (let byteIdx = 0; byteIdx < ID_BYTES; byteIdx++) {
-    const byte = dist[byteIdx];
+    const byte = localId[byteIdx] ^ targetId[byteIdx];
     if (byte !== 0) {
-      // Find leading zero bits in this byte
-      for (let bitIdx = 0; bitIdx < 8; bitIdx++) {
-        if ((byte & (0x80 >> bitIdx)) !== 0) {
-          return byteIdx * 8 + bitIdx;
-        }
-      }
+      // Math.clz32(byte) returns leading zeros of a 32-bit int.
+      // Since byte is 8-bit, we subtract 24.
+      return byteIdx * 8 + (Math.clz32(byte) - 24);
     }
   }
   return -1; // Exact match (distance 0)
