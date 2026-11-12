@@ -12,6 +12,7 @@ const DEFAULT_BYTE_WEIGHT = 0.05;
 const DEFAULT_MIN_COST = 1;
 const DEFAULT_MAX_EXECUTION_MS = 1500;
 const DEFAULT_MAX_INPUT_SIZE = 10_000_000;
+const DEFAULT_MAX_COMPLEXITY_FACTOR = 100;
 
 class DoubleSpendAttemptError extends Error {
   constructor(message) {
@@ -393,6 +394,11 @@ class ProofOfComputeLedger extends EventEmitter {
     this.maxInputSize = opts.maxInputSize !== undefined ? opts.maxInputSize : DEFAULT_MAX_INPUT_SIZE;
     if (typeof this.maxInputSize !== 'number' || !Number.isFinite(this.maxInputSize) || this.maxInputSize <= 0) {
       throw new RangeError('Invalid maxInputSize: must be a positive finite number');
+    }
+
+    this.maxComplexityFactor = opts.maxComplexityFactor !== undefined ? opts.maxComplexityFactor : DEFAULT_MAX_COMPLEXITY_FACTOR;
+    if (typeof this.maxComplexityFactor !== 'number' || !Number.isFinite(this.maxComplexityFactor) || this.maxComplexityFactor <= 0) {
+      throw new RangeError('Invalid maxComplexityFactor: must be a positive finite number');
     }
 
     this.allowSelfSettle = Boolean(opts.allowSelfSettle);
@@ -1104,12 +1110,13 @@ class ProofOfComputeLedger extends EventEmitter {
 
     const cappedTime = Math.min(executionTimeMs, this.maxExecutionMs);
     const cappedInput = Math.min(inputSize, this.maxInputSize);
+    const cappedComplexity = Math.min(complexityFactor, this.maxComplexityFactor);
 
-    if ((cappedTime === 0 && cappedInput === 0) || complexityFactor === 0) {
+    if ((cappedTime === 0 && cappedInput === 0) || cappedComplexity === 0) {
       return 0;
     }
 
-    const raw = (cappedTime * this.baseRatePerMs + cappedInput * this.byteWeight) * complexityFactor;
+    const raw = (cappedTime * this.baseRatePerMs + cappedInput * this.byteWeight) * cappedComplexity;
     if (!Number.isFinite(raw)) {
       throw new CreditOverflowError('Calculated credit overflows finite bounds');
     }

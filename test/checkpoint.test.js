@@ -103,9 +103,13 @@ test('CheckpointManager - periodic checkpointing and stop timer', async () => {
   let counter = 0;
   const stateGetter = () => ({ tick: ++counter });
 
-  manager.startPeriodicCheckpoint(shardId, stateGetter, 15);
+  manager.startPeriodicCheckpoint(shardId, stateGetter, 10);
 
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  // Poll until at least 2 ticks have occurred or timeout after 500ms
+  const start = Date.now();
+  while (counter < 2 && Date.now() - start < 500) {
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
 
   manager.stopPeriodicCheckpoint(shardId);
   const currentCount = counter;
