@@ -242,7 +242,7 @@ function parsePersistedMicro(raw, label) {
  * @param {string|Buffer} secret
  * @returns {boolean}
  */
-function verifyHmacProof(shardId, resultData, signature, secret) {
+function verifyHmacProof(shardId, resultData, signature, secret, extraParams = null) {
   if (typeof shardId !== 'string' || shardId.length === 0) {
     return false;
   }
@@ -260,11 +260,7 @@ function verifyHmacProof(shardId, resultData, signature, secret) {
 
   if (isEd25519 && secret) {
     try {
-      const payload = {
-        shardId,
-        resultHash: crypto.createHash('sha256').update(canonicalJson(resultData)).digest('hex')
-      };
-      const canonicalBytes = Buffer.from(canonicalJson(payload), 'utf8');
+      const resultHash = crypto.createHash('sha256').update(canonicalJson(resultData)).digest('hex');
       const sigBuf = Buffer.isBuffer(signature) ? signature : Buffer.from(signature, 'hex');
 
       let pubKeyObj = secret;
@@ -274,6 +270,26 @@ function verifyHmacProof(shardId, resultData, signature, secret) {
       } else if (Buffer.isBuffer(secret)) {
         pubKeyObj = crypto.createPublicKey({ key: secret, format: 'der', type: 'spki' });
       }
+
+      // 1. Try full metric-bound payload if extraParams supplied
+      if (extraParams && typeof extraParams === 'object') {
+        const fullPayload = {
+          shardId,
+          resultHash,
+          workerId: extraParams.workerId,
+          requesterId: extraParams.requesterId,
+          executionTimeMs: extraParams.executionMetrics ? extraParams.executionMetrics.executionTimeMs : undefined,
+          inputSize: extraParams.executionMetrics ? extraParams.executionMetrics.inputSize : undefined
+        };
+        const fullCanonicalBytes = Buffer.from(canonicalJson(fullPayload), 'utf8');
+        if (crypto.verify(null, fullCanonicalBytes, pubKeyObj, sigBuf)) {
+          return true;
+        }
+      }
+
+      // 2. Standard { shardId, resultHash } payload
+      const standardPayload = { shardId, resultHash };
+      const canonicalBytes = Buffer.from(canonicalJson(standardPayload), 'utf8');
       if (crypto.verify(null, canonicalBytes, pubKeyObj, sigBuf)) {
         return true;
       }
@@ -1146,7 +1162,7 @@ class ProofOfComputeLedger extends EventEmitter {
     this._assertValidNodeId(workerId, 'workerId');
     const normalizedProof = normalizeProofHex(proofOfCompute);
     if (!normalizedProof) {
-      throw new TypeError('Invalid proofOfCompute: must be a 64-character hex string or 32-byte Buffer');
+      throw new TypeError('Invalid proofOfCompute: must be a 64- or 128-character hex string or 32/64-byte Buffer');
     }
     return sha256Hex(encodeCompositeKey(shardId, workerId, normalizedProof));
   }
@@ -1308,7 +1324,11 @@ class ProofOfComputeLedger extends EventEmitter {
     // Enforce strict secret selection: if hmacSecret is explicitly supplied, do NOT fall back to public key
     const hasExplicitSecret = hmacSecret !== undefined && hmacSecret !== null;
     const verificationSecret = hasExplicitSecret ? hmacSecret : workerPublicKey;
-    const sigValid = verifyHmacProof(shardId, resultData, normalizedProof, verificationSecret);
+    const sigValid = verifyHmacProof(shardId, resultData, normalizedProof, verificationSecret, {
+      workerId,
+      requesterId,
+      executionMetrics
+    });
     if (!sigValid) {
       const msg = 'Proof-of-Compute verification failed: invalid HMAC-SHA256 signature';
       if (shouldThrowOnBadSig) throw new Error(msg);
