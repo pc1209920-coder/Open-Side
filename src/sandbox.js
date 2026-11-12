@@ -2356,7 +2356,8 @@ if (workerData && workerData.isPoolWorker) {
       try {
         const ctx = vm.createContext(Object.create(null), {
           name: 'openside-worker-shard',
-          codeGeneration: { strings: false, wasm: false }
+          codeGeneration: { strings: false, wasm: false },
+          microtaskMode: 'afterEvaluate'
         });
         ctx.__os_encoded_input = msg.encodedInput;
         ctx.__os_deterministic = msg.deterministic;
@@ -2428,7 +2429,8 @@ if (workerData && workerData.isPoolWorker) {
   try {
     const ctx = vm.createContext(Object.create(null), {
       name: 'openside-worker-shard',
-      codeGeneration: { strings: false, wasm: false }
+      codeGeneration: { strings: false, wasm: false },
+      microtaskMode: 'afterEvaluate'
     });
     ctx.__os_encoded_input = workerData.encodedInput;
     ctx.__os_deterministic = workerData.deterministic;
@@ -3010,7 +3012,8 @@ class StandbySandbox {
 
     const context = vm.createContext(Object.create(null), {
       name: 'openside-zero-trust-shard',
-      codeGeneration: { strings: false, wasm: false }
+      codeGeneration: { strings: false, wasm: false },
+      microtaskMode: 'afterEvaluate'
     });
 
     context.__os_encoded_input = encodedInput;

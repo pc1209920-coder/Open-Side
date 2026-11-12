@@ -1842,16 +1842,16 @@ class P2PNode extends EventEmitter {
 
     let execResult;
     try {
-      if (typeof sandbox.executeIsolatedShardAsync === 'function' && payload && payload.sync !== true) {
+      if (typeof sandbox.executeIsolatedShardAsync === 'function') {
         const execOptions = {};
         const localMaxTimeout = this.shardTimeoutMs || DEFAULT_SHARD_TIMEOUT_MS;
         const localMaxMem = (sandbox && sandbox.maxMemoryMb) || 128;
-        if (payload.timeoutMs !== undefined && typeof payload.timeoutMs === 'number' && Number.isFinite(payload.timeoutMs) && payload.timeoutMs > 0) {
+        if (payload && payload.timeoutMs !== undefined && typeof payload.timeoutMs === 'number' && Number.isFinite(payload.timeoutMs) && payload.timeoutMs > 0) {
           execOptions.timeoutMs = Math.min(payload.timeoutMs, localMaxTimeout);
         } else {
           execOptions.timeoutMs = localMaxTimeout;
         }
-        if (payload.memoryLimitMb !== undefined && typeof payload.memoryLimitMb === 'number' && Number.isFinite(payload.memoryLimitMb) && payload.memoryLimitMb > 0) {
+        if (payload && payload.memoryLimitMb !== undefined && typeof payload.memoryLimitMb === 'number' && Number.isFinite(payload.memoryLimitMb) && payload.memoryLimitMb > 0) {
           execOptions.memoryLimitMb = Math.min(payload.memoryLimitMb, localMaxMem);
         } else {
           execOptions.memoryLimitMb = localMaxMem;
