@@ -727,7 +727,8 @@ class GridRouter extends EventEmitter {
     }
 
     // Dynamic Tier Classification
-    if (peer.reputationScore >= 0.85 && (peer.capacityScore || 0) >= 80 && (peer.latencyMs || 999) < 100) {
+    const latency = Number.isFinite(peer.latencyMs) ? peer.latencyMs : 999;
+    if (peer.reputationScore >= 0.85 && (peer.capacityScore || 0) >= 80 && latency < 100) {
       peer.tier = 'TIER_1'; // High performance
     } else if (peer.reputationScore >= 0.60) {
       peer.tier = 'TIER_2'; // Standard desktop / workstation
