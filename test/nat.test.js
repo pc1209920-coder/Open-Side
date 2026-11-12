@@ -153,21 +153,19 @@ test('STUN Message Parser - Malformed packet rejection (fail-closed)', () => {
   assert.throws(() => parseStunMessage(badBitsBuf), /first 2 bits/);
 });
 
-let isUdpLoopbackSupported = null;
-async function checkUdpLoopback() {
-  if (isUdpLoopbackSupported !== null) return isUdpLoopbackSupported;
-  return new Promise((resolve) => {
+let udpCheckPromise = null;
+function checkUdpLoopback() {
+  if (udpCheckPromise) return udpCheckPromise;
+  udpCheckPromise = new Promise((resolve) => {
     const s1 = dgram.createSocket('udp4');
     const s2 = dgram.createSocket('udp4');
-    let timer = setTimeout(() => {
+    const timer = setTimeout(() => {
       try { s1.close(); s2.close(); } catch (_) {}
-      isUdpLoopbackSupported = false;
       resolve(false);
-    }, 300);
+    }, 150);
     s1.on('message', () => {
       clearTimeout(timer);
       try { s1.close(); s2.close(); } catch (_) {}
-      isUdpLoopbackSupported = true;
       resolve(true);
     });
     s1.bind(0, '127.0.0.1', () => {
@@ -176,11 +174,11 @@ async function checkUdpLoopback() {
       } catch (_) {
         clearTimeout(timer);
         try { s1.close(); s2.close(); } catch (_) {}
-        isUdpLoopbackSupported = false;
         resolve(false);
       }
     });
   });
+  return udpCheckPromise;
 }
 
 test('Local Mock UDP STUN Server - Full discoverPublicEndpoint request-response cycle', async (t) => {
