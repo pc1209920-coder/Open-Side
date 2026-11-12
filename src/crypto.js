@@ -706,12 +706,14 @@ class MeshCryptoEngine {
       let canonicalBytes;
       if (typeof payloadOrShardId === 'object' && payloadOrShardId !== null) {
         canonicalBytes = Buffer.from(canonicalJson(payloadOrShardId), 'utf8');
-      } else {
+      } else if (resultData !== undefined) {
         const payload = {
           shardId: payloadOrShardId,
           resultHash: crypto.createHash('sha256').update(canonicalJson(resultData)).digest('hex')
         };
         canonicalBytes = Buffer.from(canonicalJson(payload), 'utf8');
+      } else {
+        canonicalBytes = Buffer.from(String(payloadOrShardId), 'utf8');
       }
 
       const sigBuf = Buffer.isBuffer(signatureHexOrBuf)

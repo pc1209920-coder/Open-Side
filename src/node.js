@@ -1244,7 +1244,7 @@ class P2PNode extends EventEmitter {
 
     if (msg.signature && msg.identityPublicKey && this.crypto && typeof this.crypto.verifyAttestation === 'function') {
       const transcript = `${msg.nodeId}:${msg.publicKey}:${msg.epoch}:${msg.timestamp}:${msg.nonce}`;
-      const valid = this.crypto.verifyAttestation(transcript, null, msg.signature, msg.identityPublicKey);
+      const valid = this.crypto.verifyAttestation(transcript, undefined, msg.signature, msg.identityPublicKey);
       if (!valid) {
         this._failSocket(socket, new Error('Handshake failed: invalid Ed25519 transcript signature'));
         return;
@@ -1343,7 +1343,7 @@ class P2PNode extends EventEmitter {
 
     if (msg.signature && msg.identityPublicKey && this.crypto && typeof this.crypto.verifyAttestation === 'function') {
       const transcript = `${msg.nodeId}:${msg.publicKey}:${msg.epoch}:${msg.timestamp}:${msg.nonce}`;
-      const valid = this.crypto.verifyAttestation(transcript, null, msg.signature, msg.identityPublicKey);
+      const valid = this.crypto.verifyAttestation(transcript, undefined, msg.signature, msg.identityPublicKey);
       if (!valid) {
         this._failSocket(socket, new Error('Handshake failed: invalid Ed25519 transcript signature'));
         return;
