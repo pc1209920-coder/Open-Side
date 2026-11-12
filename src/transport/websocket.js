@@ -320,6 +320,7 @@ class WebSocketConnection extends EventEmitter {
 
     this._fragments = [];
     this._fragmentOpcode = 0;
+    this._fragmentedBytes = 0;
 
     this._setupSocket();
   }
@@ -410,12 +411,24 @@ class WebSocketConnection extends EventEmitter {
         this.close(1002, 'Protocol Error: unexpected continuation');
         return;
       }
+      this._fragmentedBytes += frame.payload.length;
+      if (this._fragmentedBytes > this.maxPayloadLength) {
+        this._fragments = [];
+        this._fragmentedBytes = 0;
+        this._fragmentOpcode = 0;
+        const err = new Error('Message payload exceeds maximum allowed size across fragments');
+        err.code = 1009;
+        this.emit('error', err);
+        this.close(1009, 'Message Too Big');
+        return;
+      }
       this._fragments.push(frame.payload);
       if (frame.fin) {
         const fullPayload = Buffer.concat(this._fragments);
         const op = this._fragmentOpcode;
         this._fragments = [];
         this._fragmentOpcode = 0;
+        this._fragmentedBytes = 0;
         this._emitMessage(op, fullPayload);
       }
       return;
@@ -430,6 +443,17 @@ class WebSocketConnection extends EventEmitter {
         return;
       }
       this._fragmentOpcode = frame.opcode;
+      this._fragmentedBytes = frame.payload.length;
+      if (this._fragmentedBytes > this.maxPayloadLength) {
+        this._fragments = [];
+        this._fragmentedBytes = 0;
+        this._fragmentOpcode = 0;
+        const err = new Error('Message payload exceeds maximum allowed size');
+        err.code = 1009;
+        this.emit('error', err);
+        this.close(1009, 'Message Too Big');
+        return;
+      }
       this._fragments = [frame.payload];
       return;
     }
