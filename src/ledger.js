@@ -121,8 +121,27 @@ function encodeCompositeKey(...parts) {
  * @param {unknown} value
  * @returns {string|undefined}
  */
+function canonicalJson(obj) {
+  if (obj === null || typeof obj !== 'object') {
+    if (typeof obj === 'bigint') return `${obj.toString()}n`;
+    if (typeof obj === 'number' && (!Number.isFinite(obj) || Number.isNaN(obj))) {
+      throw new TypeError('Cannot serialize non-finite numbers in canonical JSON');
+    }
+    return JSON.stringify(obj);
+  }
+  if (Array.isArray(obj)) {
+    return '[' + obj.map(item => canonicalJson(item)).join(',') + ']';
+  }
+  const keys = Object.keys(obj).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalJson(obj[k])).join(',') + '}';
+}
+
 function safeJsonStringify(value) {
-  return JSON.stringify(value, (_key, v) => (typeof v === 'bigint' ? v.toString() : v));
+  try {
+    return canonicalJson(value);
+  } catch {
+    return JSON.stringify(value, (_key, v) => (typeof v === 'bigint' ? v.toString() : v));
+  }
 }
 
 /**
@@ -229,6 +248,39 @@ function verifyHmacProof(shardId, resultData, signature, secret) {
   if (resultData === undefined) {
     return false;
   }
+
+  // Check for 64-byte Ed25519 signature
+  let isEd25519 = false;
+  if (typeof signature === 'string' && signature.length === 128 && /^[0-9a-fA-F]{128}$/.test(signature)) {
+    isEd25519 = true;
+  } else if (Buffer.isBuffer(signature) && signature.length === 64) {
+    isEd25519 = true;
+  }
+
+  if (isEd25519 && secret) {
+    try {
+      const payload = {
+        shardId,
+        resultHash: crypto.createHash('sha256').update(canonicalJson(resultData)).digest('hex')
+      };
+      const canonicalBytes = Buffer.from(canonicalJson(payload), 'utf8');
+      const sigBuf = Buffer.isBuffer(signature) ? signature : Buffer.from(signature, 'hex');
+
+      let pubKeyObj = secret;
+      if (typeof secret === 'string') {
+        const der = Buffer.from(secret, 'hex');
+        pubKeyObj = crypto.createPublicKey({ key: der, format: 'der', type: 'spki' });
+      } else if (Buffer.isBuffer(secret)) {
+        pubKeyObj = crypto.createPublicKey({ key: secret, format: 'der', type: 'spki' });
+      }
+      if (crypto.verify(null, canonicalBytes, pubKeyObj, sigBuf)) {
+        return true;
+      }
+    } catch {
+      // Fall through to HMAC check
+    }
+  }
+
   if (
     secret === undefined ||
     secret === null ||
@@ -283,9 +335,9 @@ function verifyHmacProof(shardId, resultData, signature, secret) {
  */
 function normalizeProofHex(proofOfCompute) {
   if (Buffer.isBuffer(proofOfCompute)) {
-    return proofOfCompute.length === 32 ? proofOfCompute.toString('hex').toLowerCase() : null;
+    return (proofOfCompute.length === 32 || proofOfCompute.length === 64) ? proofOfCompute.toString('hex').toLowerCase() : null;
   }
-  if (typeof proofOfCompute === 'string' && /^[0-9a-fA-F]{64}$/.test(proofOfCompute)) {
+  if (typeof proofOfCompute === 'string' && (/^[0-9a-fA-F]{64}$/.test(proofOfCompute) || /^[0-9a-fA-F]{128}$/.test(proofOfCompute))) {
     return proofOfCompute.toLowerCase();
   }
   return null;
