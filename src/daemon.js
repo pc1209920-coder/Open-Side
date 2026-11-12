@@ -145,7 +145,8 @@ class OpenSideDaemon extends EventEmitter {
         coordinatorId: `daemon-coord-${process.pid}`,
         enforceEscrow: true
       });
-      this.gateway = new OpenSideGateway(this.sea, {
+      this.gateway = new OpenSideGateway({
+        sea: this.sea,
         port: this.options.gatewayPort || 8080,
         enableCluster: true
       });

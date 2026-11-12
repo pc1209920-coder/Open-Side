@@ -124,6 +124,14 @@ class OpenSideGateway {
     }
   }
 
+  async start(...args) {
+    return this.listen(...args);
+  }
+
+  async stop(...args) {
+    return this.close(...args);
+  }
+
   _sendJson(res, statusCode, data, headers = {}) {
     if (res.writableEnded) return;
     const body = Buffer.from(JSON.stringify(data), 'utf8');

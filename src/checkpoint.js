@@ -30,6 +30,8 @@ class CheckpointManager extends EventEmitter {
     this.checkpoints = new Map();
     // shardId -> NodeJS.Timeout
     this.activeIntervals = new Map();
+    // shardId -> number (monotonically increasing high-water sequence counter)
+    this._seqByShard = new Map();
   }
 
   /**
@@ -99,7 +101,9 @@ class CheckpointManager extends EventEmitter {
       this.checkpoints.set(shardId, shardHistory);
     }
 
-    const seq = shardHistory.length + 1;
+    const nextSeq = (this._seqByShard.get(shardId) || 0) + 1;
+    this._seqByShard.set(shardId, nextSeq);
+    const seq = nextSeq;
     const stepIndex = typeof meta.stepIndex === 'number' ? meta.stepIndex : seq;
     const stateBuffer = this.serializeState(state);
     const checksum = this.computeChecksum(stateBuffer, seq, stepIndex);
@@ -256,6 +260,7 @@ class CheckpointManager extends EventEmitter {
   clearShard(shardId) {
     this.stopPeriodicCheckpoint(shardId);
     this.checkpoints.delete(shardId);
+    this._seqByShard.delete(shardId);
   }
 
   /**
@@ -266,6 +271,7 @@ class CheckpointManager extends EventEmitter {
       this.stopPeriodicCheckpoint(shardId);
     }
     this.checkpoints.clear();
+    this._seqByShard.clear();
   }
 }
 
