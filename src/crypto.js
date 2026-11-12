@@ -19,8 +19,27 @@ function safeJsonReviver(key, value) {
   return value;
 }
 
+function canonicalJson(obj) {
+  if (obj === null || typeof obj !== 'object') {
+    if (typeof obj === 'bigint') return `${obj.toString()}n`;
+    if (typeof obj === 'number' && (!Number.isFinite(obj) || Number.isNaN(obj))) {
+      throw new TypeError('Cannot serialize non-finite numbers in canonical JSON');
+    }
+    return JSON.stringify(obj);
+  }
+  if (Array.isArray(obj)) {
+    return '[' + obj.map(item => canonicalJson(item)).join(',') + ']';
+  }
+  const keys = Object.keys(obj).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalJson(obj[k])).join(',') + '}';
+}
+
 function safeJsonStringify(value) {
-  return JSON.stringify(value, (_key, v) => (typeof v === 'bigint' ? v.toString() : v));
+  try {
+    return canonicalJson(value);
+  } catch {
+    return JSON.stringify(value, (_key, v) => (typeof v === 'bigint' ? v.toString() : v));
+  }
 }
 
 function computeBoundAad(userAadBuf, timestamp, nonce, epoch) {
@@ -44,6 +63,14 @@ class MeshCryptoEngine {
     this.ecdh = crypto.createECDH(this.curve);
     this.publicKey = this.ecdh.generateKeys('hex');
     this.nodeId = crypto.createHash('sha256').update(this.publicKey).digest('hex').slice(0, 40);
+
+    // Ed25519 identity keypair
+    const idKp = crypto.generateKeyPairSync('ed25519');
+    this.identityPrivateKey = idKp.privateKey;
+    this.identityPublicKey = idKp.publicKey;
+    this.identityPublicKeyDer = idKp.publicKey.export({ type: 'spki', format: 'der' });
+    this.identityPublicKeyHex = this.identityPublicKeyDer.toString('hex');
+
     this.outboundNonce = 1;
 
     if (opts.maxTimeDriftMs !== undefined) {
@@ -632,6 +659,68 @@ class MeshCryptoEngine {
       }
 
       return crypto.timingSafeEqual(sigBuf, expectedBuf);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Signs a canonical Proof-of-Compute attestation using the node's Ed25519 identity key.
+   * Produces an unforgeable, publicly verifiable asymmetric signature.
+   * @param {object|string} payloadOrShardId
+   * @param {any} [resultData]
+   * @param {KeyObject} [privateKey=this.identityPrivateKey]
+   * @returns {string} Hex-encoded Ed25519 signature
+   */
+  signAttestation(payloadOrShardId, resultData, privateKey = this.identityPrivateKey) {
+    let canonicalBytes;
+    if (typeof payloadOrShardId === 'object' && payloadOrShardId !== null) {
+      canonicalBytes = Buffer.from(canonicalJson(payloadOrShardId), 'utf8');
+    } else {
+      const payload = {
+        shardId: payloadOrShardId,
+        resultHash: crypto.createHash('sha256').update(canonicalJson(resultData)).digest('hex')
+      };
+      canonicalBytes = Buffer.from(canonicalJson(payload), 'utf8');
+    }
+    const sig = crypto.sign(null, canonicalBytes, privateKey);
+    return sig.toString('hex');
+  }
+
+  /**
+   * Verifies an Ed25519 Proof-of-Compute attestation against a worker's public identity key.
+   * @param {object|string} payloadOrShardId
+   * @param {any} resultData
+   * @param {string|Buffer} signatureHexOrBuf
+   * @param {KeyObject|string|Buffer} publicKey
+   * @returns {boolean}
+   */
+  verifyAttestation(payloadOrShardId, resultData, signatureHexOrBuf, publicKey = this.identityPublicKey) {
+    try {
+      let canonicalBytes;
+      if (typeof payloadOrShardId === 'object' && payloadOrShardId !== null) {
+        canonicalBytes = Buffer.from(canonicalJson(payloadOrShardId), 'utf8');
+      } else {
+        const payload = {
+          shardId: payloadOrShardId,
+          resultHash: crypto.createHash('sha256').update(canonicalJson(resultData)).digest('hex')
+        };
+        canonicalBytes = Buffer.from(canonicalJson(payload), 'utf8');
+      }
+
+      const sigBuf = Buffer.isBuffer(signatureHexOrBuf)
+        ? signatureHexOrBuf
+        : Buffer.from(String(signatureHexOrBuf), 'hex');
+
+      let pubKeyObj = publicKey;
+      if (typeof publicKey === 'string') {
+        const der = Buffer.from(publicKey, 'hex');
+        pubKeyObj = crypto.createPublicKey({ key: der, format: 'der', type: 'spki' });
+      } else if (Buffer.isBuffer(publicKey)) {
+        pubKeyObj = crypto.createPublicKey({ key: publicKey, format: 'der', type: 'spki' });
+      }
+
+      return crypto.verify(null, canonicalBytes, pubKeyObj, sigBuf);
     } catch {
       return false;
     }
