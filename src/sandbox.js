@@ -11,6 +11,8 @@ const DEFAULT_VIRTUAL_TIMESTAMP = 1700000000000;
 const MAX_SERIALIZATION_DEPTH = 128;
 const MAX_OUTPUT_ARRAY_LENGTH = 5000000;
 const MAX_RECONSTRUCT_NODES = 5000000;
+const MAX_INPUT_BYTES = 1024 * 1024; // 1 MB
+const MAX_OUTPUT_BYTES = 2 * 1024 * 1024; // 2 MB
 
 const INVISIBLE_CHAR_REGEX = /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u206F\uFEFF\u00AD\u180E]/g;
 const INVISIBLE_CHAR_TEST_REGEX = /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u206F\uFEFF\u00AD\u180E]/;
@@ -1740,7 +1742,11 @@ function encodeInputForRealm(value, seen = new WeakSet(), depth = 0) {
     }
   }
 
-  return JSON.stringify(encodeNode(value, depth));
+  const encoded = JSON.stringify(encodeNode(value, depth));
+  if (Buffer.byteLength(encoded, 'utf8') > MAX_INPUT_BYTES) {
+    throw new RangeError(`Shard input exceeds maximum allowed size of ${MAX_INPUT_BYTES} bytes`);
+  }
+  return encoded;
 }
 
 function computeDeterministicSeeds(shardId, encodedInput) {
@@ -1795,7 +1801,13 @@ function reconstructInHostRealm(value, seen = new WeakSet(), depth = 0, sortKeys
     return value;
   }
   const t = typeof value;
-  if (t === 'boolean' || t === 'number' || t === 'string' || t === 'bigint') {
+  if (t === 'string') {
+    if (Buffer.byteLength(value, 'utf8') > MAX_OUTPUT_BYTES) {
+      throw new RangeError(`Sandbox output string exceeds maximum allowed size of ${MAX_OUTPUT_BYTES} bytes`);
+    }
+    return value;
+  }
+  if (t === 'boolean' || t === 'number' || t === 'bigint') {
     return value;
   }
   if (t === 'function' || t === 'symbol') {
@@ -1809,6 +1821,9 @@ function reconstructInHostRealm(value, seen = new WeakSet(), depth = 0, sortKeys
 
   try {
     if (Array.isArray(value)) {
+      if (value.length > MAX_OUTPUT_ARRAY_LENGTH) {
+        throw new RangeError(`Sandbox output array length exceeds maximum of ${MAX_OUTPUT_ARRAY_LENGTH}`);
+      }
       const arr = new Array(value.length);
       for (let i = 0; i < value.length; i++) {
         if (Object.prototype.hasOwnProperty.call(value, i)) {
@@ -2272,12 +2287,21 @@ function toHost(val, seen = new WeakSet(), depth = 0) {
   if (depth > MAX_DEPTH) throw new RangeError('Sandbox output exceeds maximum nesting depth');
   if (val === null || val === undefined) return val;
   const t = typeof val;
-  if (t === 'boolean' || t === 'number' || t === 'string' || t === 'bigint') return val;
+  if (t === 'string') {
+    if (Buffer.byteLength(val, 'utf8') > ${MAX_OUTPUT_BYTES}) {
+      throw new RangeError('Sandbox output string exceeds maximum allowed size of ${MAX_OUTPUT_BYTES} bytes');
+    }
+    return val;
+  }
+  if (t === 'boolean' || t === 'number' || t === 'bigint') return val;
   if (t === 'function' || t === 'symbol') throw new TypeError('Sandbox output cannot contain ' + t + ' values');
   if (seen.has(val)) throw new TypeError('Sandbox output contains circular references');
   seen.add(val);
   try {
     if (Array.isArray(val)) {
+      if (val.length > ${MAX_OUTPUT_ARRAY_LENGTH}) {
+        throw new RangeError('Sandbox output array length exceeds maximum of ${MAX_OUTPUT_ARRAY_LENGTH}');
+      }
       const arr = new Array(val.length);
       for (let i = 0; i < val.length; i++) {
         if (Object.prototype.hasOwnProperty.call(val, i)) {
