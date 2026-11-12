@@ -1242,6 +1242,15 @@ class P2PNode extends EventEmitter {
       return;
     }
 
+    if (msg.signature && msg.identityPublicKey && this.crypto && typeof this.crypto.verifyAttestation === 'function') {
+      const transcript = `${msg.nodeId}:${msg.publicKey}:${msg.epoch}:${msg.timestamp}:${msg.nonce}`;
+      const valid = this.crypto.verifyAttestation(transcript, null, msg.signature, msg.identityPublicKey);
+      if (!valid) {
+        this._failSocket(socket, new Error('Handshake failed: invalid Ed25519 transcript signature'));
+        return;
+      }
+    }
+
     let agreedEpoch = msg.epoch;
     if (pending && pending.epoch !== msg.epoch) {
       agreedEpoch = msg.nodeId > this.nodeId ? msg.epoch : pending.epoch;
@@ -1259,10 +1268,15 @@ class P2PNode extends EventEmitter {
       type: 'HANDSHAKE_ACK',
       nodeId: this.nodeId,
       publicKey: this.crypto.publicKey,
+      identityPublicKey: this.crypto.identityPublicKeyHex,
       epoch: agreedEpoch,
       timestamp: this._now(),
       nonce: crypto.randomBytes(16).toString('hex')
     };
+    if (this.crypto && typeof this.crypto.signAttestation === 'function') {
+      const transcript = `${ack.nodeId}:${ack.publicKey}:${ack.epoch}:${ack.timestamp}:${ack.nonce}`;
+      ack.signature = this.crypto.signAttestation(transcript);
+    }
 
     this._writeFrame(socket, ack).catch((err) => {
       this._failSocket(socket, err);
@@ -1325,6 +1339,15 @@ class P2PNode extends EventEmitter {
     if (!validation.ok) {
       this._failSocket(socket, validation.error);
       return;
+    }
+
+    if (msg.signature && msg.identityPublicKey && this.crypto && typeof this.crypto.verifyAttestation === 'function') {
+      const transcript = `${msg.nodeId}:${msg.publicKey}:${msg.epoch}:${msg.timestamp}:${msg.nonce}`;
+      const valid = this.crypto.verifyAttestation(transcript, null, msg.signature, msg.identityPublicKey);
+      if (!valid) {
+        this._failSocket(socket, new Error('Handshake failed: invalid Ed25519 transcript signature'));
+        return;
+      }
     }
 
     if (msg.epoch !== pending.epoch) {
@@ -1426,10 +1449,15 @@ class P2PNode extends EventEmitter {
         type: 'HANDSHAKE',
         nodeId: this.nodeId,
         publicKey: this.crypto.publicKey,
+        identityPublicKey: this.crypto.identityPublicKeyHex,
         epoch,
         timestamp: this._now(),
         nonce: crypto.randomBytes(16).toString('hex')
       };
+      if (this.crypto && typeof this.crypto.signAttestation === 'function') {
+        const transcript = `${handshakeFrame.nodeId}:${handshakeFrame.publicKey}:${handshakeFrame.epoch}:${handshakeFrame.timestamp}:${handshakeFrame.nonce}`;
+        handshakeFrame.signature = this.crypto.signAttestation(transcript);
+      }
 
       this._recordHandshakeNonce(this.nodeId, handshakeFrame.nonce);
 

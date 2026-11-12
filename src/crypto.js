@@ -20,6 +20,7 @@ function safeJsonReviver(key, value) {
 }
 
 function canonicalJson(obj) {
+  if (obj === undefined) return undefined;
   if (obj === null || typeof obj !== 'object') {
     if (typeof obj === 'bigint') return `${obj.toString()}n`;
     if (typeof obj === 'number' && (!Number.isFinite(obj) || Number.isNaN(obj))) {
@@ -28,9 +29,12 @@ function canonicalJson(obj) {
     return JSON.stringify(obj);
   }
   if (Array.isArray(obj)) {
-    return '[' + obj.map(item => canonicalJson(item)).join(',') + ']';
+    return '[' + obj.map(item => {
+      const res = canonicalJson(item);
+      return res === undefined ? 'null' : res;
+    }).join(',') + ']';
   }
-  const keys = Object.keys(obj).sort();
+  const keys = Object.keys(obj).filter(k => obj[k] !== undefined).sort();
   return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalJson(obj[k])).join(',') + '}';
 }
 
@@ -676,12 +680,14 @@ class MeshCryptoEngine {
     let canonicalBytes;
     if (typeof payloadOrShardId === 'object' && payloadOrShardId !== null) {
       canonicalBytes = Buffer.from(canonicalJson(payloadOrShardId), 'utf8');
-    } else {
+    } else if (resultData !== undefined) {
       const payload = {
         shardId: payloadOrShardId,
         resultHash: crypto.createHash('sha256').update(canonicalJson(resultData)).digest('hex')
       };
       canonicalBytes = Buffer.from(canonicalJson(payload), 'utf8');
+    } else {
+      canonicalBytes = Buffer.from(String(payloadOrShardId), 'utf8');
     }
     const sig = crypto.sign(null, canonicalBytes, privateKey);
     return sig.toString('hex');
