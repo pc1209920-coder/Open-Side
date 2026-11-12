@@ -1,6 +1,26 @@
 const crypto = require('node:crypto');
 const EventEmitter = require('node:events');
 const { CheckpointManager } = require('./checkpoint');
+const { canonicalize } = require('./sandbox');
+
+function canonicalJson(obj) {
+  if (obj === undefined) return undefined;
+  if (obj === null || typeof obj !== 'object') {
+    if (typeof obj === 'bigint') return `${obj.toString()}n`;
+    if (typeof obj === 'number' && (!Number.isFinite(obj) || Number.isNaN(obj))) {
+      throw new TypeError('Cannot serialize non-finite numbers in canonical JSON');
+    }
+    return JSON.stringify(obj);
+  }
+  if (Array.isArray(obj)) {
+    return '[' + obj.map(item => {
+      const res = canonicalJson(item);
+      return res === undefined ? 'null' : res;
+    }).join(',') + ']';
+  }
+  const keys = Object.keys(obj).filter(k => obj[k] !== undefined).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalJson(obj[k])).join(',') + '}';
+}
 
 const DEFAULT_MAX_CPU_THRESHOLD = 0.25;
 const DEFAULT_MIN_FREE_MEM_RATIO = 0.10;
@@ -924,8 +944,9 @@ class GridRouter extends EventEmitter {
       // Prioritize higher reputation score if available
       const repA = a.reputationScore !== undefined ? a.reputationScore : 0.8;
       const repB = b.reputationScore !== undefined ? b.reputationScore : 0.8;
-      if (Math.abs(repA - repB) >= 0.1) {
-        return repB - repA; // Higher reputation preferred
+      const diff = repB - repA;
+      if (Math.abs(diff) >= 0.1) {
+        return diff > 0 ? 1 : -1; // Higher reputation preferred
       }
       if (a.latencyMs !== b.latencyMs) {
         return a.latencyMs - b.latencyMs;
@@ -1159,7 +1180,8 @@ class GridRouter extends EventEmitter {
     }
 
     const attempts = (shard.attempts || 0) + 1;
-    const assignedShard = { ...shard, attempts };
+    const dispatchId = shard.dispatchId || crypto.randomBytes(16).toString('hex');
+    const assignedShard = { ...shard, attempts, dispatchId };
     const assignedAt = this._now();
 
     const hadPrevEntry = this.inFlightShards.has(assignedShard.shardId);
@@ -1168,7 +1190,8 @@ class GridRouter extends EventEmitter {
       shard: assignedShard,
       peerId: peer.nodeId,
       assignedAt,
-      attempts
+      attempts,
+      dispatchId
     };
 
     peer.activeShards = (peer.activeShards || 0) + 1;
@@ -1204,12 +1227,17 @@ class GridRouter extends EventEmitter {
 
   /**
    * Marks an in-flight shard completed, freeing peer capacity and flushing queued shards.
+   * If expectedDispatchId is provided, rejects stale attempts fail-closed.
    * @param {string} shardId
+   * @param {string} [expectedDispatchId]
    */
-  completeShard(shardId) {
+  completeShard(shardId, expectedDispatchId) {
     const entry = this.inFlightShards.get(shardId);
     if (!entry) {
       return false;
+    }
+    if (expectedDispatchId && entry.dispatchId && entry.dispatchId !== expectedDispatchId) {
+      return false; // Stale dispatch completion ignored
     }
     this.inFlightShards.delete(shardId);
     const peer = this.peerTable.get(entry.peerId);
@@ -1375,9 +1403,29 @@ class GridRouter extends EventEmitter {
       throw new TypeError('Invalid executions: expected non-empty Array');
     }
 
-    // Map each output to deterministic canonical serialization hash
-    const hashes = executions.map((exec) => {
-      const canonicalStr = JSON.stringify(exec.output, (_k, v) => (typeof v === 'bigint' ? `${v}n` : v));
+    // Deduplicate executions by peerId / workerId: a single peer cannot submit repeated votes
+    const peerSeen = new Set();
+    const uniqueExecutions = [];
+    for (const exec of executions) {
+      const pid = exec.peerId || exec.workerId || 'unknown';
+      if (pid !== 'unknown' && peerSeen.has(pid)) {
+        continue; // ignore duplicate submissions from the same peer
+      }
+      if (pid !== 'unknown') peerSeen.add(pid);
+      uniqueExecutions.push(exec);
+    }
+
+    const effectiveExecutions = uniqueExecutions.length > 0 ? uniqueExecutions : executions;
+
+    // Map each output to deterministic canonical serialization hash using key-sorted canonical JSON
+    const hashes = effectiveExecutions.map((exec) => {
+      let canonicalStr;
+      try {
+        const canon = canonicalize(exec.output);
+        canonicalStr = canonicalJson(canon);
+      } catch {
+        canonicalStr = canonicalJson(exec.output);
+      }
       const hash = crypto.createHash('sha256').update(String(canonicalStr)).digest('hex');
       return {
         hash,
@@ -1401,9 +1449,9 @@ class GridRouter extends EventEmitter {
       }
     }
 
-    const majorityNeeded = Math.floor(executions.length / 2) + 1;
+    const majorityNeeded = Math.floor(effectiveExecutions.length / 2) + 1;
     if (maxCount < majorityNeeded) {
-      throw new Error(`Consensus failed: largest agreement (${maxCount}/${executions.length}) did not meet majority (${majorityNeeded})`);
+      throw new Error(`Consensus failed: largest agreement (${maxCount}/${effectiveExecutions.length}) did not meet majority (${majorityNeeded})`);
     }
 
     const consensusPeers = [];
@@ -1435,7 +1483,7 @@ class GridRouter extends EventEmitter {
 
     return {
       consensusOutput,
-      agreementRatio: maxCount / executions.length,
+      agreementRatio: maxCount / effectiveExecutions.length,
       consensusPeers,
       dissentingPeers
     };
