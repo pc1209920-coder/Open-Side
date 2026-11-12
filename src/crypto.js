@@ -13,7 +13,10 @@ function normalizeOptions(options) {
 }
 
 function safeJsonReviver(key, value) {
-  return key === '__proto__' ? undefined : value;
+  if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+    return undefined;
+  }
+  return value;
 }
 
 function safeJsonStringify(value) {

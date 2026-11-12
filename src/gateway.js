@@ -205,9 +205,9 @@ class OpenSideGateway {
     }
     const headerStr = String(authHeader).trim();
     const token = /^bearer\s+/i.test(headerStr) ? headerStr.replace(/^bearer\s+/i, '').trim() : headerStr;
-    const tokenBuf = Buffer.from(token);
-    const keyBuf = Buffer.from(this.apiKey);
-    if (tokenBuf.length !== keyBuf.length || !crypto.timingSafeEqual(tokenBuf, keyBuf)) {
+    const tokenHash = crypto.createHash('sha256').update(token).digest();
+    const keyHash = crypto.createHash('sha256').update(this.apiKey).digest();
+    if (!crypto.timingSafeEqual(tokenHash, keyHash)) {
       this._sendError(res, 401, 'Invalid API Key', 'authentication_error');
       return false;
     }
@@ -338,6 +338,23 @@ class OpenSideGateway {
       const seaResult = await this.sea.submitWorkload(workloadCode, messages, {
         chunkSize: Math.max(1, Math.min(messages.length, 4))
       });
+
+      if (seaResult.status !== 'COMPLETED') {
+        const statusMap = {
+          REJECTED: 429,
+          INSUFFICIENT_CREDIT_BALANCE: 402,
+          SANDBOX_VALIDATION_FAILED: 503,
+          SHED: 503
+        };
+        const httpStatus = statusMap[seaResult.status] || 502;
+        return this._sendError(
+          res,
+          httpStatus,
+          `Compute Sea workload ${seaResult.status}: ${seaResult.error || seaResult.reason || 'Workload was not completed'}`,
+          'compute_sea_error',
+          seaResult.status
+        );
+      }
 
       const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
       const userPrompt = lastUserMsg && typeof lastUserMsg.content === 'string' ? lastUserMsg.content : '';
@@ -497,6 +514,23 @@ class OpenSideGateway {
       const seaResult = await this.sea.submitWorkload(workloadCode, messages, {
         chunkSize: Math.max(1, Math.min(messages.length, 4))
       });
+
+      if (seaResult.status !== 'COMPLETED') {
+        const statusMap = {
+          REJECTED: 429,
+          INSUFFICIENT_CREDIT_BALANCE: 402,
+          SANDBOX_VALIDATION_FAILED: 503,
+          SHED: 503
+        };
+        const httpStatus = statusMap[seaResult.status] || 502;
+        return this._sendError(
+          res,
+          httpStatus,
+          `Compute Sea workload ${seaResult.status}: ${seaResult.error || seaResult.reason || 'Workload was not completed'}`,
+          'compute_sea_error',
+          seaResult.status
+        );
+      }
 
       const msgId = `msg_${crypto.randomUUID()}`;
       const responseText = `[Open-Side ComputeSea] Workload executed across ${seaResult.shards?.length || 1} mesh shard(s). Processed ${messages.length} message(s). Total mesh compute cost: ${seaResult.totalCost || 0} credits.`;
