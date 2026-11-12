@@ -776,6 +776,14 @@ class P2PNode extends EventEmitter {
 
       // Check for multiplexed stream frame (format tag 0x03)
       if (bodyBuf.length >= 4 && bodyBuf[0] === STREAM_FRAME_TAG) {
+        if (meta.handshakeState !== 'ESTABLISHED') {
+          parser.chunks.length = 0;
+          parser.totalBytes = 0;
+          const unauthErr = new SecurityError('Multiplexed stream frame received on unauthenticated connection');
+          unauthErr.code = 'ERR_UNAUTHENTICATED_STREAM_FRAME';
+          this._failSocket(socket, unauthErr);
+          return;
+        }
         const streamId = bodyBuf.readUInt16BE(1);
         const flags = bodyBuf.readUInt8(3);
         const payloadData = bodyBuf.subarray(4);

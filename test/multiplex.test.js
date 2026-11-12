@@ -66,10 +66,10 @@ test('Stream Multiplexing - Bidirectional concurrent streams over live P2PNode c
     const nodeA = new P2PNode(useIpc ? { ipcPath: makeUniqueIpcPath('mux-a') } : { port: 0 });
     const nodeB = new P2PNode(useIpc ? { ipcPath: makeUniqueIpcPath('mux-b') } : { port: 0 });
 
-    let epA, epB;
+    let epA;
     try {
-      epA = await nodeA.listen(useIpc ? { ipcPath: nodeA.ipcPath } : undefined);
-      epB = await nodeB.listen(useIpc ? { ipcPath: nodeB.ipcPath } : undefined);
+      epA = await nodeA.listen(useIpc ? { ipcPath: nodeA._configuredIpcPath } : undefined);
+      await nodeB.listen(useIpc ? { ipcPath: nodeB._configuredIpcPath } : undefined);
     } catch (err) {
       await Promise.allSettled([nodeA.close(), nodeB.close()]);
       if (!useIpc && isTcpRestrictedError(err)) {
@@ -137,8 +137,8 @@ test('Batch Shard Pipelining - dispatchPipelinedBatch executes concurrent shards
 
     let workerEp;
     try {
-      workerEp = await workerNode.listen(useIpc ? { ipcPath: workerNode.ipcPath } : undefined);
-      await coordinatorNode.listen(useIpc ? { ipcPath: coordinatorNode.ipcPath } : undefined);
+      workerEp = await workerNode.listen(useIpc ? { ipcPath: workerNode._configuredIpcPath } : undefined);
+      await coordinatorNode.listen(useIpc ? { ipcPath: coordinatorNode._configuredIpcPath } : undefined);
     } catch (err) {
       await Promise.allSettled([workerNode.close(), coordinatorNode.close()]);
       if (!useIpc && isTcpRestrictedError(err)) {
