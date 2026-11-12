@@ -325,6 +325,12 @@ class WebSocketConnection extends EventEmitter {
     this._setupSocket();
   }
 
+  _fail(err) {
+    if (this.listenerCount('error') > 0) {
+      this.emit('error', err);
+    }
+  }
+
   _setupSocket() {
     this.socket.on('data', (chunk) => {
       try {
@@ -333,14 +339,14 @@ class WebSocketConnection extends EventEmitter {
           this._handleFrame(frame);
         }
       } catch (err) {
-        this.emit('error', err);
+        this._fail(err);
         const code = typeof err.code === 'number' ? err.code : 1002;
         this.close(code, err.message);
       }
     });
 
     this.socket.on('error', (err) => {
-      this.emit('error', err);
+      this._fail(err);
     });
 
     this.socket.on('close', (hadError) => {
@@ -361,7 +367,7 @@ class WebSocketConnection extends EventEmitter {
     // In this case, the server MUST send a Close frame with status code 1002 (protocol error).
     if (this.isServer && !frame.masked) {
       const err = new Error('Client frame must be masked');
-      this.emit('error', err);
+      this._fail(err);
       this.close(1002, 'Protocol Error: unmasked client frame');
       return;
     }
@@ -369,7 +375,7 @@ class WebSocketConnection extends EventEmitter {
     // RFC 6455 5.1: A client MUST close a connection if it detects a masked frame from server (code 1002).
     if (!this.isServer && frame.masked) {
       const err = new Error('Server frame must not be masked');
-      this.emit('error', err);
+      this._fail(err);
       this.close(1002, 'Protocol Error: masked server frame');
       return;
     }
@@ -407,7 +413,7 @@ class WebSocketConnection extends EventEmitter {
       if (this._fragments.length === 0) {
         // Unexpected continuation without initial data frame
         const err = new Error('Unexpected continuation frame');
-        this.emit('error', err);
+        this._fail(err);
         this.close(1002, 'Protocol Error: unexpected continuation');
         return;
       }
@@ -418,7 +424,7 @@ class WebSocketConnection extends EventEmitter {
         this._fragmentOpcode = 0;
         const err = new Error('Message payload exceeds maximum allowed size across fragments');
         err.code = 1009;
-        this.emit('error', err);
+        this._fail(err);
         this.close(1009, 'Message Too Big');
         return;
       }
@@ -438,7 +444,7 @@ class WebSocketConnection extends EventEmitter {
       if (this._fragments.length > 0) {
         // Cannot start a new fragment sequence while one is already in progress
         const err = new Error('Cannot start new fragment before previous fragmented message completed');
-        this.emit('error', err);
+        this._fail(err);
         this.close(1002, 'Protocol Error: unfinished fragment sequence');
         return;
       }
@@ -450,7 +456,7 @@ class WebSocketConnection extends EventEmitter {
         this._fragmentOpcode = 0;
         const err = new Error('Message payload exceeds maximum allowed size');
         err.code = 1009;
-        this.emit('error', err);
+        this._fail(err);
         this.close(1009, 'Message Too Big');
         return;
       }
@@ -461,7 +467,7 @@ class WebSocketConnection extends EventEmitter {
     if (this._fragments.length > 0) {
       // Received unfragmented data frame while fragment sequence was pending
       const err = new Error('Expected continuation frame during fragmented message');
-      this.emit('error', err);
+      this._fail(err);
       this.close(1002, 'Protocol Error: expected continuation frame');
       return;
     }
@@ -782,6 +788,17 @@ class WebSocketClient extends EventEmitter {
 
     req.on('timeout', () => {
       req.destroy(new Error(`WebSocket handshake timed out after ${handshakeTimeout}ms`));
+    });
+
+    req.on('response', (res) => {
+      // If we receive a regular HTTP response instead of an upgrade (e.g. 400, 404, 426)
+      if (res.statusCode !== 101) {
+        this.readyState = 3; // CLOSED
+        const err = new Error(`Unexpected server response: ${res.statusCode} ${res.statusMessage || ''}`);
+        err.statusCode = res.statusCode;
+        req.destroy();
+        this._fail(err);
+      }
     });
 
     req.on('upgrade', (res, socket, head) => {

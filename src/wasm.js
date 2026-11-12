@@ -9,9 +9,12 @@ const DEFAULT_MAX_EXECUTION_MS = 2000;
 
 // WASM binary magic header \0asm (0x00, 0x61, 0x73, 0x6d)
 const WASM_MAGIC = Buffer.from([0x00, 0x61, 0x73, 0x6d]);
+// WASM binary version 1 header (0x01, 0x00, 0x00, 0x00)
+const WASM_VERSION_1 = Buffer.from([0x01, 0x00, 0x00, 0x00]);
+const MAX_WASM_BINARY_BYTES = 16 * 1024 * 1024; // 16 MB
 
 /**
- * Validates whether a buffer starts with standard WebAssembly magic bytes.
+ * Validates whether a buffer starts with standard WebAssembly magic bytes and version 1 header.
  * @param {Buffer|Uint8Array} binary
  * @returns {boolean}
  */
@@ -19,12 +22,16 @@ function isValidWasmHeader(binary) {
   if (!binary || (!Buffer.isBuffer(binary) && !(binary instanceof Uint8Array))) {
     return false;
   }
-  if (binary.length < 4) return false;
+  if (binary.length < 8 || binary.length > MAX_WASM_BINARY_BYTES) return false;
   return (
     binary[0] === WASM_MAGIC[0] &&
     binary[1] === WASM_MAGIC[1] &&
     binary[2] === WASM_MAGIC[2] &&
-    binary[3] === WASM_MAGIC[3]
+    binary[3] === WASM_MAGIC[3] &&
+    binary[4] === WASM_VERSION_1[0] &&
+    binary[5] === WASM_VERSION_1[1] &&
+    binary[6] === WASM_VERSION_1[2] &&
+    binary[7] === WASM_VERSION_1[3]
   );
 }
 
@@ -248,6 +255,10 @@ class WasmEngine extends EventEmitter {
 
       const worker = new Worker(workerCode, {
         eval: true,
+        resourceLimits: {
+          maxOldGenerationSizeMb: 128,
+          maxYoungGenerationSizeMb: 32
+        },
         workerData: {
           binaryBuffer: wasmBinary,
           exportName,
@@ -296,6 +307,14 @@ class WasmEngine extends EventEmitter {
         if (settled) return;
         cleanup();
         reject(err);
+      });
+
+      worker.on('exit', (code) => {
+        if (settled) return;
+        cleanup();
+        if (code !== 0) {
+          reject(new Error(`WASM worker stopped unexpectedly with exit code ${code}`));
+        }
       });
     });
   }
