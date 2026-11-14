@@ -1216,7 +1216,80 @@ function tryEvalStringAtom(tokens, idx, constEnv) {
       val = val.split('').reverse().join(tokens[nextIdx + 12].value);
       nextIdx += 14;
     }
-    return { value: val, nextIdx, literalCount: 1 };
+
+    // Check trailing .slice(...) / .substring(...) / .substr(...)
+    if (
+      tokens[nextIdx] && tokens[nextIdx].type === 'Punctuator' && tokens[nextIdx].value === '.' &&
+      tokens[nextIdx + 1] && tokens[nextIdx + 1].type === 'Identifier' &&
+      (tokens[nextIdx + 1].value === 'slice' || tokens[nextIdx + 1].value === 'substring' || tokens[nextIdx + 1].value === 'substr') &&
+      tokens[nextIdx + 2] && tokens[nextIdx + 2].type === 'Punctuator' && tokens[nextIdx + 2].value === '('
+    ) {
+      const closeSlice = findMatchingClose(tokens, nextIdx + 2, '(', ')');
+      if (closeSlice !== -1) {
+        const args = [];
+        let k = nextIdx + 3;
+        let ok = true;
+        while (k < closeSlice) {
+          const tok = tokens[k];
+          if (tok.type === 'Number') {
+            args.push(Number(tok.value));
+            k += 1;
+          } else if (tok.type === 'Punctuator' && tok.value === '-' && tokens[k + 1] && tokens[k + 1].type === 'Number') {
+            args.push(-Number(tokens[k + 1].value));
+            k += 2;
+          } else {
+            ok = false;
+            break;
+          }
+          if (k < closeSlice) {
+            if (tokens[k] && tokens[k].type === 'Punctuator' && tokens[k].value === ',') k += 1;
+            else { ok = false; break; }
+          }
+        }
+        if (ok && args.length <= 2) {
+          val = val.slice(...args);
+          nextIdx = closeSlice + 1;
+        }
+      }
+    }
+
+    // Check trailing .concat(...)
+    let concatLits = 0;
+    while (
+      tokens[nextIdx] && tokens[nextIdx].type === 'Punctuator' && tokens[nextIdx].value === '.' &&
+      tokens[nextIdx + 1] && tokens[nextIdx + 1].type === 'Identifier' && tokens[nextIdx + 1].value === 'concat' &&
+      tokens[nextIdx + 2] && tokens[nextIdx + 2].type === 'Punctuator' && tokens[nextIdx + 2].value === '('
+    ) {
+      const closeConcat = findMatchingClose(tokens, nextIdx + 2, '(', ')');
+      if (closeConcat === -1) break;
+      let ok = true;
+      let concatVal = val;
+      let k = nextIdx + 3;
+      let argLits = 0;
+      while (k < closeConcat) {
+        const arg = tryEvalStringExpr(tokens, k, constEnv);
+        if (!arg) { ok = false; break; }
+        concatVal += arg.value;
+        argLits += arg.literalCount;
+        k = arg.nextIdx;
+        if (k < closeConcat) {
+          if (tokens[k] && tokens[k].type === 'Punctuator' && tokens[k].value === ',') {
+            k += 1;
+          } else {
+            ok = false;
+            break;
+          }
+        }
+      }
+      if (ok) {
+        val = concatVal;
+        concatLits += argLits;
+        nextIdx = closeConcat + 1;
+        continue;
+      }
+      break;
+    }
+    return { value: val, nextIdx, literalCount: 1 + concatLits };
   }
 
   if (t.type === 'TemplateHead') {

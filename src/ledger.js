@@ -123,6 +123,7 @@ function encodeCompositeKey(...parts) {
  * @returns {string|undefined}
  */
 function canonicalJson(obj) {
+  if (obj === undefined) return undefined;
   if (obj === null || typeof obj !== 'object') {
     if (typeof obj === 'bigint') return `${obj.toString()}n`;
     if (typeof obj === 'number' && (!Number.isFinite(obj) || Number.isNaN(obj))) {
@@ -131,9 +132,12 @@ function canonicalJson(obj) {
     return JSON.stringify(obj);
   }
   if (Array.isArray(obj)) {
-    return '[' + obj.map(item => canonicalJson(item)).join(',') + ']';
+    return '[' + obj.map(item => {
+      const res = canonicalJson(item);
+      return res === undefined ? 'null' : res;
+    }).join(',') + ']';
   }
-  const keys = Object.keys(obj).sort();
+  const keys = Object.keys(obj).filter(k => obj[k] !== undefined).sort();
   return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalJson(obj[k])).join(',') + '}';
 }
 
@@ -265,10 +269,18 @@ function verifyHmacProof(shardId, resultData, signature, secret, extraParams = n
 
       let pubKeyObj = secret;
       if (typeof secret === 'string') {
-        const der = Buffer.from(secret, 'hex');
-        pubKeyObj = crypto.createPublicKey({ key: der, format: 'der', type: 'spki' });
+        if (secret.startsWith('-----BEGIN')) {
+          pubKeyObj = crypto.createPublicKey(secret);
+        } else {
+          const der = Buffer.from(secret, 'hex');
+          pubKeyObj = crypto.createPublicKey({ key: der, format: 'der', type: 'spki' });
+        }
       } else if (Buffer.isBuffer(secret)) {
-        pubKeyObj = crypto.createPublicKey({ key: secret, format: 'der', type: 'spki' });
+        if (secret.length === 32) {
+          pubKeyObj = crypto.createPublicKey({ key: secret, format: 'raw', type: 'ed25519' });
+        } else {
+          pubKeyObj = crypto.createPublicKey({ key: secret, format: 'der', type: 'spki' });
+        }
       }
 
       // 1. Try full metric-bound payload if extraParams supplied
@@ -279,7 +291,10 @@ function verifyHmacProof(shardId, resultData, signature, secret, extraParams = n
           workerId: extraParams.workerId,
           requesterId: extraParams.requesterId,
           executionTimeMs: extraParams.executionMetrics ? extraParams.executionMetrics.executionTimeMs : undefined,
-          inputSize: extraParams.executionMetrics ? extraParams.executionMetrics.inputSize : undefined
+          inputSize: extraParams.executionMetrics ? extraParams.executionMetrics.inputSize : undefined,
+          complexityFactor: extraParams.executionMetrics && extraParams.executionMetrics.complexityFactor !== undefined
+            ? extraParams.executionMetrics.complexityFactor
+            : undefined
         };
         const fullCanonicalBytes = Buffer.from(canonicalJson(fullPayload), 'utf8');
         if (crypto.verify(null, fullCanonicalBytes, pubKeyObj, sigBuf)) {
@@ -1202,6 +1217,7 @@ class ProofOfComputeLedger extends EventEmitter {
       hmacSecret,
       attestationNonce,
       expectedInputSize,
+      expectedComplexityFactor,
       inputData,
       shard,
       escrowId
@@ -1248,6 +1264,22 @@ class ProofOfComputeLedger extends EventEmitter {
     const { executionTimeMs, inputSize, complexityFactor = 1 } = executionMetrics;
     if (complexityFactor !== undefined && (typeof complexityFactor !== 'number' || !Number.isFinite(complexityFactor) || complexityFactor <= 0)) {
       throw new RangeError('Invalid complexityFactor: must be a positive finite number');
+    }
+    if (expectedComplexityFactor !== undefined) {
+      if (typeof expectedComplexityFactor !== 'number' || !Number.isFinite(expectedComplexityFactor) || expectedComplexityFactor <= 0) {
+        throw new RangeError('Invalid expectedComplexityFactor: must be a positive finite number');
+      }
+      if (complexityFactor > expectedComplexityFactor) {
+        throw new RangeError(
+          `Complexity factor mismatch: claimed ${complexityFactor} exceeds expected ${expectedComplexityFactor}`
+        );
+      }
+    } else if (shard && typeof shard.complexityFactor === 'number' && shard.complexityFactor > 0) {
+      if (complexityFactor > shard.complexityFactor) {
+        throw new RangeError(
+          `Complexity factor mismatch: claimed ${complexityFactor} exceeds shard complexityFactor ${shard.complexityFactor}`
+        );
+      }
     }
     const cost = this.calculateCredit(executionTimeMs, inputSize, complexityFactor);
     const costMicro = toMicroCredits(cost, 'cost');
@@ -1471,6 +1503,9 @@ class ProofOfComputeLedger extends EventEmitter {
       } else {
         const consumeMicro = costMicro <= matchingEscrow.amountMicro ? costMicro : matchingEscrow.amountMicro;
         matchingEscrow.amountMicro -= consumeMicro;
+        if (matchingEscrow.amountMicro === 0n) {
+          this._escrowsById.delete(matchingEscrow.escrowId);
+        }
         requester.unshardedReservedMicro = requester.unshardedReservedMicro >= consumeMicro
           ? requester.unshardedReservedMicro - consumeMicro
           : 0n;

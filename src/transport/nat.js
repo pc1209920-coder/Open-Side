@@ -4,6 +4,7 @@ const dgram = require('node:dgram');
 const crypto = require('node:crypto');
 const EventEmitter = require('node:events');
 const net = require('node:net');
+const os = require('node:os');
 
 // RFC 5389 Constants
 const STUN_MAGIC_COOKIE = 0x2112A442;
@@ -91,7 +92,8 @@ function encodeStunMessage(options = {}) {
   let attrsLength = 0;
   for (const attr of attributes) {
     if (Buffer.isBuffer(attr)) {
-      attrsLength += attr.length;
+      const padding = (4 - (attr.length % 4)) % 4;
+      attrsLength += attr.length + padding;
     }
   }
 
@@ -105,7 +107,8 @@ function encodeStunMessage(options = {}) {
   for (const attr of attributes) {
     if (Buffer.isBuffer(attr)) {
       attr.copy(buffer, offset);
-      offset += attr.length;
+      const padding = (4 - (attr.length % 4)) % 4;
+      offset += attr.length + padding;
     }
   }
 
@@ -249,9 +252,29 @@ function expandIpv6(ip) {
   let leftParts = left ? left.split(':') : [];
   let rightParts = right !== undefined ? (right ? right.split(':') : []) : null;
 
+  // Helper to expand dotted-quad IPv4 in IPv6 (e.g. ::ffff:192.0.2.1)
+  const expandDottedQuad = (parts) => {
+    if (!parts || parts.length === 0) return parts;
+    const last = parts[parts.length - 1];
+    if (last && last.includes('.')) {
+      const quads = last.split('.').map((p) => parseInt(p, 10));
+      if (quads.length === 4 && quads.every((q) => Number.isInteger(q) && q >= 0 && q <= 255)) {
+        parts = parts.slice(0, -1);
+        parts.push(((quads[0] << 8) | quads[1]).toString(16));
+        parts.push(((quads[2] << 8) | quads[3]).toString(16));
+      }
+    }
+    return parts;
+  };
+
+  leftParts = expandDottedQuad(leftParts);
+  if (rightParts !== null) {
+    rightParts = expandDottedQuad(rightParts);
+  }
+
   if (rightParts !== null) {
     const missing = 8 - (leftParts.length + rightParts.length);
-    const zeros = new Array(missing).fill('0');
+    const zeros = new Array(Math.max(0, missing)).fill('0');
     leftParts = leftParts.concat(zeros).concat(rightParts);
   }
 
@@ -279,10 +302,15 @@ function parseStunMessage(buffer) {
   const type = buffer.readUInt16BE(0) & 0x3fff;
   const messageLength = buffer.readUInt16BE(2);
   const magicCookie = buffer.readUInt32BE(4);
-  const transactionId = buffer.subarray(8, 20);
+  const transactionId = Buffer.from(buffer.subarray(8, 20));
 
   if (magicCookie !== STUN_MAGIC_COOKIE) {
     throw new Error(`Invalid STUN magic cookie: 0x${magicCookie.toString(16)} (expected 0x${STUN_MAGIC_COOKIE.toString(16)})`);
+  }
+
+  // RFC 5389 §6: Message length must be a multiple of 4 bytes
+  if ((messageLength & 0x03) !== 0) {
+    throw new Error(`Invalid STUN message length: ${messageLength} is not a multiple of 4 bytes`);
   }
 
   if (buffer.length < 20 + messageLength) {
@@ -294,6 +322,7 @@ function parseStunMessage(buffer) {
   let mappedAddress = null;
   let changedAddress = null;
   let sourceAddress = null;
+  let errorCode = null;
 
   let offset = 20;
   const end = 20 + messageLength;
@@ -322,6 +351,9 @@ function parseStunMessage(buffer) {
     } else if (attrType === STUN_ATTR_TYPE.SOURCE_ADDRESS) {
       sourceAddress = decodeMappedAddress(attrValue);
       attrObj.parsed = sourceAddress;
+    } else if (attrType === STUN_ATTR_TYPE.ERROR_CODE) {
+      errorCode = decodeErrorCode(attrValue);
+      attrObj.parsed = errorCode;
     }
 
     attributes.push(attrObj);
@@ -343,8 +375,28 @@ function parseStunMessage(buffer) {
     mappedAddress,
     changedAddress,
     sourceAddress,
+    errorCode,
     endpoint: resolvedEndpoint
   };
+}
+
+/**
+ * Decodes an ERROR-CODE attribute value buffer (RFC 5389 type 0x0009).
+ * @param {Buffer} valueBuf
+ * @returns {{ code: number, reason: string }}
+ */
+function decodeErrorCode(valueBuf) {
+  if (!Buffer.isBuffer(valueBuf)) {
+    throw new TypeError('Buffer required to decode ERROR-CODE');
+  }
+  if (valueBuf.length < 4) {
+    throw new Error('ERROR-CODE attribute value too short (minimum 4 bytes)');
+  }
+  const classVal = valueBuf[2] & 0x07;
+  const numberVal = valueBuf[3];
+  const code = classVal * 100 + numberVal;
+  const reason = valueBuf.subarray(4).toString('utf8');
+  return { code, reason };
 }
 
 /**
@@ -354,6 +406,12 @@ function parseStunMessage(buffer) {
  * @returns {{ family: 'IPv4'|'IPv6', ip: string, port: number }}
  */
 function decodeXorMappedAddress(valueBuf, transactionId) {
+  if (!Buffer.isBuffer(valueBuf)) {
+    throw new TypeError('Buffer required for XOR-MAPPED-ADDRESS value');
+  }
+  if (!Buffer.isBuffer(transactionId) || transactionId.length !== 12) {
+    throw new TypeError('STUN transactionId must be a 12-byte Buffer');
+  }
   if (valueBuf.length < 4) {
     throw new Error('XOR-MAPPED-ADDRESS value too short');
   }
@@ -399,6 +457,9 @@ function decodeXorMappedAddress(valueBuf, transactionId) {
  * @returns {{ family: 'IPv4'|'IPv6', ip: string, port: number }}
  */
 function decodeMappedAddress(valueBuf) {
+  if (!Buffer.isBuffer(valueBuf)) {
+    throw new TypeError('Buffer required for MAPPED-ADDRESS value');
+  }
   if (valueBuf.length < 4) {
     throw new Error('MAPPED-ADDRESS value too short');
   }
@@ -427,6 +488,61 @@ function decodeMappedAddress(valueBuf) {
 }
 
 /**
+ * Asynchronously binds a UDP socket with fail-closed error handling.
+ * @param {dgram.Socket} socket
+ * @param {number} [port=0]
+ * @param {string} [address]
+ * @returns {Promise<void>}
+ */
+function bindSocketAsync(socket, port = 0, address) {
+  return new Promise((resolve, reject) => {
+    let bound = false;
+    const onError = (err) => {
+      if (!bound) {
+        socket.removeListener('listening', onListening);
+        reject(err);
+      }
+    };
+    const onListening = () => {
+      bound = true;
+      socket.removeListener('error', onError);
+      resolve();
+    };
+    socket.once('error', onError);
+    socket.once('listening', onListening);
+    try {
+      if (address) {
+        socket.bind(port, address);
+      } else {
+        socket.bind(port);
+      }
+    } catch (err) {
+      socket.removeListener('error', onError);
+      socket.removeListener('listening', onListening);
+      reject(err);
+    }
+  });
+}
+
+/**
+ * Checks whether an IP address belongs to local network interfaces.
+ * @param {string} ip
+ * @returns {boolean}
+ */
+function isLocalInterfaceAddress(ip) {
+  if (ip === '127.0.0.1' || ip === '::1') return true;
+  try {
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+      for (const iface of interfaces[name]) {
+        if (iface && iface.address === ip) return true;
+      }
+    }
+  } catch (_) {}
+  return false;
+}
+
+/**
  * RFC 5389 STUN Client.
  */
 class StunClient extends EventEmitter {
@@ -450,13 +566,23 @@ class StunClient extends EventEmitter {
    * If stunHost is not provided, iterates through configured public STUN servers until one succeeds.
    *
    * @param {string} [stunHost]
-   * @param {number} [stunPort=3478]
-   * @param {number} [timeoutMs=3000]
+   * @param {number|object} [stunPort=3478]
+   * @param {number|object} [timeoutMs=3000]
    * @param {object} [options]
    * @param {dgram.Socket} [options.socket] - Optional existing UDP socket to probe through
    * @returns {Promise<{ ip: string, port: number, family: string, rttMs: number, server: { host: string, port: number } }>}
    */
   async discoverPublicEndpoint(stunHost, stunPort = 3478, timeoutMs = this.defaultTimeoutMs, options = {}) {
+    // Normalize overloaded arguments
+    if (typeof stunPort === 'object' && stunPort !== null) {
+      options = stunPort;
+      stunPort = 3478;
+      timeoutMs = typeof options.timeoutMs === 'number' ? options.timeoutMs : this.defaultTimeoutMs;
+    } else if (typeof timeoutMs === 'object' && timeoutMs !== null) {
+      options = timeoutMs;
+      timeoutMs = typeof options.timeoutMs === 'number' ? options.timeoutMs : this.defaultTimeoutMs;
+    }
+
     if (stunHost) {
       return this._querySingleServer(stunHost, stunPort, timeoutMs, options.socket);
     }
@@ -520,7 +646,8 @@ class StunClient extends EventEmitter {
 
           if (parsed.type !== STUN_MSG_TYPE.BINDING_RESPONSE) {
             cleanup();
-            reject(new Error(`STUN received non-success response type: 0x${parsed.type.toString(16)}`));
+            const errDetails = parsed.errorCode ? ` (code ${parsed.errorCode.code}: ${parsed.errorCode.reason})` : '';
+            reject(new Error(`STUN received non-success response type: 0x${parsed.type.toString(16)}${errDetails}`));
             return;
           }
 
@@ -540,7 +667,7 @@ class StunClient extends EventEmitter {
             server: { host, port }
           });
         } catch (err) {
-          // If parse fails or unrelated packet, ignore or reject if from target host
+          // If parse fails or unrelated packet, ignore
         }
       };
 
@@ -553,13 +680,20 @@ class StunClient extends EventEmitter {
         reject(new Error(`STUN request to ${host}:${port} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
 
-      // Send the binding request packet
-      socket.send(req.buffer, 0, req.buffer.length, port, host, (err) => {
-        if (err && !settled) {
+      // Send the binding request packet with synchronous error trapping
+      try {
+        socket.send(req.buffer, 0, req.buffer.length, port, host, (err) => {
+          if (err && !settled) {
+            cleanup();
+            reject(err);
+          }
+        });
+      } catch (sendErr) {
+        if (!settled) {
           cleanup();
-          reject(err);
+          reject(sendErr);
         }
-      });
+      }
     });
   }
 }
@@ -581,8 +715,8 @@ class NatTraversal extends EventEmitter {
   /**
    * Classifies the local NAT mapping behavior according to RFC 3489 / RFC 4787 logic:
    * Probes across multiple STUN servers using the same local socket to determine:
-   * - OPEN_INTERNET: Public IP matches local socket address
-   * - FULL_CONE: External IP:port remains identical regardless of destination STUN server
+   * - OPEN_INTERNET: Public IP matches local socket address or interface address
+   * - FULL_CONE: External IP:port remains identical regardless of destination STUN server (Endpoint-Independent Mapping)
    * - RESTRICTED_CONE / PORT_RESTRICTED_CONE
    * - SYMMETRIC: Different external mapped ports for different destination servers
    * - UDP_BLOCKED: No STUN responses received
@@ -600,13 +734,8 @@ class NatTraversal extends EventEmitter {
     }
 
     const socket = dgram.createSocket('udp4');
-    // Bind to arbitrary ephemeral local port
-    await new Promise((resolve, reject) => {
-      socket.bind(0, (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
+    socket.on('error', () => {}); // Fallback handler to prevent unhandled error crash
+    await bindSocketAsync(socket, 0);
 
     try {
       const localAddress = socket.address();
@@ -639,9 +768,9 @@ class NatTraversal extends EventEmitter {
       }
 
       const primary = mappings[0].endpoint;
-      const isLoopbackMatch = (localAddress.address === '0.0.0.0' || localAddress.address === '127.0.0.1') &&
+      const isLoopbackMatch = (localAddress.address === '0.0.0.0' || localAddress.address === '127.0.0.1' || localAddress.address === '::' || localAddress.address === '::1') &&
         (primary.ip === '127.0.0.1' || primary.ip === '::1');
-      const isPublicMatch = (primary.ip === localAddress.address || isLoopbackMatch) && primary.port === localAddress.port;
+      const isPublicMatch = (primary.ip === localAddress.address || isLoopbackMatch || isLocalInterfaceAddress(primary.ip)) && primary.port === localAddress.port;
 
       if (mappings.length === 1) {
         return {
@@ -676,7 +805,7 @@ class NatTraversal extends EventEmitter {
       }
 
       // Same mapped IP and Port for different destination STUN servers -> CONE NAT
-      // For general hole-punching classification, full cone allows direct inbound packets.
+      // (Endpoint-Independent Mapping)
       return {
         natType: NAT_TYPE.FULL_CONE,
         publicIp: primary.ip,
@@ -719,6 +848,8 @@ class UdpHolePuncher extends EventEmitter {
     this.punchIntervalMs = options.punchIntervalMs || 100;
     this.maxAttempts = options.maxAttempts || 30;
     this._punchTimer = null;
+    this._activePunchCleanup = null;
+    this._activePunchReject = null;
     this.localEndpoint = null;
     this.publicEndpoint = null;
     this.isPunching = false;
@@ -735,12 +866,10 @@ class UdpHolePuncher extends EventEmitter {
   async initialize(options = {}) {
     if (!this.socket) {
       this.socket = dgram.createSocket('udp4');
-      await new Promise((resolve, reject) => {
-        this.socket.bind(options.bindPort || 0, (err) => {
-          if (err) reject(err);
-          else resolve();
-        });
+      this.socket.on('error', (err) => {
+        this.emit('warn', err);
       });
+      await bindSocketAsync(this.socket, options.bindPort || 0);
     }
 
     this.localEndpoint = this.socket.address();
@@ -790,6 +919,9 @@ class UdpHolePuncher extends EventEmitter {
     if (!remoteCoordinates || !remoteCoordinates.ip || !remoteCoordinates.port) {
       throw new TypeError('Invalid remoteCoordinates: must contain ip and port');
     }
+    if (this.isPunching) {
+      throw new Error('Hole punch already in progress');
+    }
 
     const targetIp = remoteCoordinates.ip;
     const targetPort = remoteCoordinates.port;
@@ -808,6 +940,8 @@ class UdpHolePuncher extends EventEmitter {
       const cleanup = () => {
         settled = true;
         this.isPunching = false;
+        this._activePunchCleanup = null;
+        this._activePunchReject = null;
         if (this._punchTimer) {
           clearInterval(this._punchTimer);
           this._punchTimer = null;
@@ -817,13 +951,26 @@ class UdpHolePuncher extends EventEmitter {
         }
         if (this.socket) {
           this.socket.removeListener('message', onMessage);
+          this.socket.removeListener('error', onSocketError);
         }
       };
+
+      this._activePunchCleanup = cleanup;
+      this._activePunchReject = reject;
+
+      const onSocketError = (err) => {
+        this.emit('warn', err);
+      };
+      this.socket.on('error', onSocketError);
 
       const onMessage = (msg, rinfo) => {
         if (settled) return;
 
-        // Check if message is from target IP
+        // Verify sender IP if targetIp is a valid IP address to avoid spoofed replies
+        if (net.isIP(targetIp) && rinfo.address !== targetIp) {
+          return;
+        }
+
         if (msg.equals(magicSync)) {
           // Immediately reply with ACK to open remote state
           try {
@@ -853,11 +1000,15 @@ class UdpHolePuncher extends EventEmitter {
       const sendPunch = () => {
         if (settled) return;
         attempts++;
-        this.socket.send(magicSync, 0, magicSync.length, targetPort, targetIp, (err) => {
-          if (err) {
-            this.emit('warn', err);
-          }
-        });
+        try {
+          this.socket.send(magicSync, 0, magicSync.length, targetPort, targetIp, (err) => {
+            if (err) {
+              this.emit('warn', err);
+            }
+          });
+        } catch (sendErr) {
+          this.emit('warn', sendErr);
+        }
 
         if (attempts >= this.maxAttempts) {
           cleanup();
@@ -877,9 +1028,16 @@ class UdpHolePuncher extends EventEmitter {
   }
 
   /**
-   * Closes the socket if owned by this instance.
+   * Closes the socket if owned by this instance and cleans up pending operations.
    */
   close() {
+    if (this.isPunching && this._activePunchCleanup) {
+      const reject = this._activePunchReject;
+      this._activePunchCleanup();
+      if (reject) {
+        reject(new Error('Hole puncher closed'));
+      }
+    }
     if (this._punchTimer) {
       clearInterval(this._punchTimer);
       this._punchTimer = null;
@@ -906,6 +1064,9 @@ module.exports = {
   parseStunMessage,
   decodeXorMappedAddress,
   decodeMappedAddress,
+  decodeErrorCode,
+  bindSocketAsync,
+  isLocalInterfaceAddress,
   StunClient,
   NatTraversal,
   UdpHolePuncher

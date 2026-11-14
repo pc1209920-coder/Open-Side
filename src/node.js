@@ -56,6 +56,14 @@ class HandshakeTimeoutError extends Error {
   }
 }
 
+class SecurityError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'SecurityError';
+    this.code = 'ERR_SECURITY';
+  }
+}
+
 class MultiplexError extends Error {
   constructor(message, code = 'ERR_MULTIPLEX') {
     super(message);
@@ -1022,17 +1030,17 @@ class P2PNode extends EventEmitter {
         throw new MultiplexError(`Stream ID ${streamId} already active on this socket`, 'ERR_STREAM_EXISTS');
       }
     } else {
-      // Auto-assign next odd (for initiator) or next free streamId
-      let candidate = (this._nextStreamId % 65534) + 1;
+      // Auto-assign next free streamId
+      let candidate = this._nextStreamId;
       let attempts = 0;
       while (meta.streams.has(candidate) && attempts < 65535) {
-        candidate = (candidate % 65534) + 1;
+        candidate = (candidate % 65535) + 1;
         attempts++;
       }
       if (attempts >= 65535) {
         throw new MultiplexError('Exhausted stream ID space on connection', 'ERR_STREAM_EXHAUSTED');
       }
-      this._nextStreamId = (candidate % 65534) + 1;
+      this._nextStreamId = (candidate % 65535) + 1;
       streamId = candidate;
     }
 
@@ -2230,6 +2238,7 @@ module.exports = {
   P2PNode,
   P2PStream,
   MultiplexError,
+  SecurityError,
   STREAM_FRAME_TAG,
   STREAM_FLAG_DATA,
   STREAM_FLAG_FIN,

@@ -660,6 +660,11 @@ class GridRouter extends EventEmitter {
       lastSeen: this._now()
     };
 
+    if (existingPeer && existingPeer.reputationScore !== undefined && (telemetry === null || telemetry.reputationScore === undefined)) {
+      peerInfo.reputationScore = existingPeer.reputationScore;
+      peerInfo.tier = existingPeer.tier;
+    }
+
     this.peerTable.set(peerNodeId, peerInfo);
 
     if (telemetry && telemetry.reputationScore !== undefined) {
@@ -945,7 +950,7 @@ class GridRouter extends EventEmitter {
       const repA = a.reputationScore !== undefined ? a.reputationScore : 0.8;
       const repB = b.reputationScore !== undefined ? b.reputationScore : 0.8;
       const diff = repB - repA;
-      if (Math.abs(diff) >= 0.1) {
+      if (Math.round(Math.abs(diff) * 100) / 100 >= 0.1) {
         return diff > 0 ? 1 : -1; // Higher reputation preferred
       }
       if (a.latencyMs !== b.latencyMs) {
@@ -1418,13 +1423,20 @@ class GridRouter extends EventEmitter {
     const effectiveExecutions = uniqueExecutions.length > 0 ? uniqueExecutions : executions;
 
     // Map each output to deterministic canonical serialization hash using key-sorted canonical JSON
-    const hashes = effectiveExecutions.map((exec) => {
+    const hashes = effectiveExecutions.map((exec, idx) => {
       let canonicalStr;
       try {
         const canon = canonicalize(exec.output);
         canonicalStr = canonicalJson(canon);
       } catch {
-        canonicalStr = canonicalJson(exec.output);
+        try {
+          canonicalStr = canonicalJson(exec.output);
+        } catch {
+          canonicalStr = `__unserializable_output_${idx}_${crypto.randomBytes(8).toString('hex')}`;
+        }
+      }
+      if (canonicalStr === undefined) {
+        canonicalStr = '__undefined__';
       }
       const hash = crypto.createHash('sha256').update(String(canonicalStr)).digest('hex');
       return {

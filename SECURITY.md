@@ -2,14 +2,15 @@
 
 ## Supported Versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.4.x   | :white_check_mark: |
-| < 0.4.0 | :x:                |
+| Version    | Supported          |
+| ---------- | ------------------ |
+| 0.9.x-beta | :white_check_mark: |
+| 1.0.x      | :white_check_mark: |
+| < 0.9.0    | :x:                |
 
 ## Zero-Trust Architecture & Fail-Closed Guarantees
 
-Open-Side (**Single Compute Sea**) enforces fail-closed security boundaries across cryptography, host resource gating, code sandboxing, P2P wire framing, and economic settlement using exclusively native Node.js core APIs (`node:crypto`, `node:vm`, `node:worker_threads`, `node:net`, `node:os`).
+Open-Side (**Single Compute Sea**) enforces fail-closed security boundaries across cryptography, host resource gating, code sandboxing, P2P wire framing, and economic settlement using exclusively native Node.js core APIs (`node:crypto`, `node:vm`, `node:worker_threads`, `node:net`, `node:os`, `node:events`, `node:v8`, `node:http`, `node:dgram`, `node:cluster`).
 
 ### 1. Transport & Session Cryptography (`src/crypto.js`)
 - **Ephemeral ECDH Key Exchange (`prime256v1`)**: Sessions negotiate fresh ephemeral keypairs (`130`-char uncompressed hex public keys) with `40`-char SHA-256 node identifiers. Mismatched curves, invalid EC points, and malformed keys fail closed.
@@ -25,22 +26,52 @@ Open-Side (**Single Compute Sea**) enforces fail-closed security boundaries acro
 ### 3. Zero-Privilege Sandbox Isolation (`src/sandbox.js`)
 - **Static AST / Token Pre-Validation**: Normalizes Unicode/hex/octal escape sequences prior to scanning and rejects forbidden host/prototype tokens (`process`, `require`, `import`, `eval`, `Function`, `__proto__`, `constructor`, `prototype`) before compilation.
 - **Zero-Privilege V8 VM & Worker Thread Resource Caps**: Untrusted code executes inside isolated `node:vm` contexts (null-prototype context, frozen built-ins, no `fs`/`net`/`child_process`/`process`) and `node:worker_threads` workers constrained by `resourceLimits` (heap memory cap) and strict millisecond execution timeouts so infinite loops and OOM allocations terminate without impacting the host process.
+- **Microtask Queue Timeout Guard**: Prevents unbounded microtask drain loops (`queueMicrotask`, `Promise.resolve().then(...)`) from starving the event loop or evading VM timeouts.
 - **Deterministic State Virtualization**: Deep-freezes input data and virtualizes non-deterministic primitives so computations cannot mutate host state or leak side-channel environment state.
 
 ### 4. P2P Wire Framing & Transport Security (`src/node.js`)
 - **Length-Prefixed Binary Framing**: Native `node:net` TCP and local IPC transport frames messages with 4-byte big-endian unsigned lengths, rejecting oversized frames (`maxFrameSize = 16 MB`, `FrameTooLargeError`) and malformed JSON fail-closed before buffering payloads.
 - **Session-Gated Dispatch & Timeouts**: Enforces two-way ephemeral ECDH handshakes (`handshakeTimeoutMs = 5000 ms`, `HandshakeTimeoutError`), seen handshake nonce tracking, and HKDF-SHA512 session key establishment before accepting encrypted shard or PoC frames; destroyed or disconnected sockets fail closed (`SocketDestroyedError`) and trigger shard rescheduling.
+- **Stream Multiplexing Safety**: Enforces 2-byte stream ID boundaries, stream state machine invariants, and frame corruption detection fail-closed over concurrent duplex streams.
 
 ### 5. Proof-of-Compute Ledger Integrity (`src/ledger.js`)
 - **Double-Spend & Replay Prevention**: `verifyAndSettle()` validates HMAC-SHA256 Proof-of-Compute attestations in constant time before mutating any state, enforcing `settledAttestations`, shard-proof uniqueness, per-worker `usedNonces`, and anti-self-settlement checks (`DoubleSpendAttemptError`).
 - **Exact Fixed-Point Accounting, Escrow & Audit Trail**: Uses integer `BigInt` micro-credit accounting (`1e-6` resolution, capped at `Number.MAX_SAFE_INTEGER` via `CreditOverflowError`), fail-closed balance and escrow checks (`InsufficientCreditBalanceError`, `UnknownAccountError`), non-negative balance conservation, and a SHA-256 hash-chained audit log verifiable from genesis via `verifyAuditLog()`.
 
-### 6. Supply-Chain & Zero-Dependency Policy
-- `package.json` enforces zero runtime `dependencies` and zero `devDependencies`, eliminating third-party npm supply-chain exposure.
+### 6. WebAssembly Sandboxing & Resource Bounds (`src/wasm.js`)
+- **Capability Isolation**: Blocks ambient OS, filesystem, and network imports; WASM modules run purely in a capability-free environment.
+- **Memory Bounding**: Enforces strict `WebAssembly.Memory` page limits (`initialPages`, `maxPages`, maximum allocation limits) preventing host memory exhaustion.
+- **Execution Timeout & Infinite Loop Termination**: Executes WASM shards within isolated worker threads with millisecond execution timeouts, promptly terminating non-halting modules.
+- **Synthetic Header & Bytecode Validation**: Validates `\0asm` magic header and section boundaries fail-closed prior to instantiation.
+
+### 7. State Checkpoint Serialization & Integrity (`src/checkpoint.js`)
+- **Cryptographic Tamper Detection**: Computes SHA-256 / SHA-512 integrity digests over monotonically indexed snapshots; corrupted or manipulated state payloads fail closed with `IntegrityViolationError`.
+- **Bounded LRU Eviction**: Restricts stored checkpoints per shard (`maxCheckpointsPerShard`) to prevent memory exhaustion and DoS via snapshot flooding.
+- **Safe Structured Deserialization**: Uses native `node:v8` deserialization with fail-closed type validation against prototype tampering.
+
+### 8. Kademlia DHT Routing Table Security (`src/dht.js`)
+- **Metric Verification**: Enforces 160-bit XOR distance metric properties (symmetry, identity, triangle inequality).
+- **Sybil & Routing Flooding Defense**: Bounded 160 $k$-buckets ($k=20$) with LRU replacement cache guards and duplicate update handling prevent bucket poisoning and routing table exhaustion.
+- **Deterministic Key Expiration**: TTL expiration on stored values prevents stale or abandoned records from lingering indefinitely.
+
+### 9. STUN & NAT Traversal Security (`src/transport/nat.js`)
+- **Packet Validation & Spoofing Defense**: Strict verification of STUN magic cookie (`0x2112A442`) and transaction ID matching between requests and responses to prevent blind injection attacks.
+- **Buffer Boundary Bounds**: Validates attribute lengths and enforces 4-byte boundary padding; malformed or truncated STUN frames reject fail-closed without buffer over-reads.
+
+### 10. Native RFC 6455 WebSocket Transport (`src/transport/websocket.js`)
+- **Frame Masking Enforcement**: Rejects unmasked client frames fail-closed with protocol error code `1002` as required by RFC 6455.
+- **Payload Limits & Fragmentation**: Enforces maximum frame payload sizes to prevent heap exhaustion; reassembles streaming fragmented frames with strict state-machine checks.
+- **UTF-8 Payload Validation**: Validates text frame UTF-8 encoding prior to dispatching messages.
+
+### 11. Headless Daemon & Cluster Isolation (`src/daemon.js`)
+- **Atomic PID File Management**: Protects daemon singleton state via atomic PID file creation and collision detection, preventing concurrent conflicting daemon instances.
+- **Cluster IPC Safety**: Isolates parallel worker processes via IPC; unhandled worker crashes trigger self-healing replacement without taking down the master process.
+
+### 12. Supply-Chain & Zero-Dependency Policy
+- `package.json` enforces zero runtime `dependencies` and zero `devDependencies`, completely eliminating third-party npm supply-chain exposure.
 
 ## Reporting a Vulnerability
 Please report any sandbox escape vectors, cryptographic flaws, anti-replay bypasses, wire framing bugs, or ledger double-spend issues via the GitHub **Security** tab (Security Advisories). Include:
-- Affected module (`src/crypto.js`, `src/router.js`, `src/sandbox.js`, `src/node.js`, `src/ledger.js`, or `src/index.js`)
+- Affected module (`src/crypto.js`, `src/router.js`, `src/sandbox.js`, `src/node.js`, `src/ledger.js`, `src/gateway.js`, `src/checkpoint.js`, `src/dht.js`, `src/wasm.js`, `src/daemon.js`, `src/transport/websocket.js`, `src/transport/nat.js`, or `src/index.js`)
 - Minimal reproducible proof-of-concept and Node.js version
 - Expected fail-closed behavior vs. observed behavior
-

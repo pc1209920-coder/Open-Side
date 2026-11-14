@@ -1,11 +1,15 @@
 'use strict';
 
 const EventEmitter = require('node:events');
+const crypto = require('node:crypto');
+const vm = require('node:vm');
 
 const WASM_PAGE_SIZE = 65536; // 64 KB per WebAssembly page
 const DEFAULT_INITIAL_PAGES = 1; // 64 KB
 const DEFAULT_MAX_PAGES = 256; // 16 MB max default memory
+const MAX_ALLOWED_PAGES = 65536; // 4 GB spec ceiling for 32-bit WebAssembly
 const DEFAULT_MAX_EXECUTION_MS = 2000;
+const DEFAULT_MAX_CACHE_ENTRIES = 100;
 
 // WASM binary magic header \0asm (0x00, 0x61, 0x73, 0x6d)
 const WASM_MAGIC = Buffer.from([0x00, 0x61, 0x73, 0x6d]);
@@ -15,23 +19,43 @@ const MAX_WASM_BINARY_BYTES = 16 * 1024 * 1024; // 16 MB
 
 /**
  * Validates whether a buffer starts with standard WebAssembly magic bytes and version 1 header.
- * @param {Buffer|Uint8Array} binary
+ * Accepts Buffer, Uint8Array, ArrayBuffer, and ArrayBufferViews (DataView).
+ * Defensively copies SharedArrayBuffer views to prevent TOCTOU race tampering.
+ * @param {Buffer|Uint8Array|ArrayBuffer|ArrayBufferView} binary
  * @returns {boolean}
  */
 function isValidWasmHeader(binary) {
-  if (!binary || (!Buffer.isBuffer(binary) && !(binary instanceof Uint8Array))) {
+  if (!binary) {
     return false;
   }
-  if (binary.length < 8 || binary.length > MAX_WASM_BINARY_BYTES) return false;
+  let bytes;
+  if (Buffer.isBuffer(binary) || binary instanceof Uint8Array) {
+    // If backed by SharedArrayBuffer, defensive copy first 8 bytes to prevent concurrent mutation
+    if (typeof SharedArrayBuffer !== 'undefined' && binary.buffer instanceof SharedArrayBuffer) {
+      bytes = new Uint8Array(binary.slice(0, 8));
+    } else {
+      bytes = binary;
+    }
+  } else if (binary instanceof ArrayBuffer) {
+    bytes = new Uint8Array(binary);
+  } else if (ArrayBuffer.isView(binary)) {
+    bytes = new Uint8Array(binary.buffer, binary.byteOffset, binary.byteLength);
+  } else {
+    return false;
+  }
+
+  const len = bytes.length !== undefined ? bytes.length : bytes.byteLength;
+  if (len < 8 || len > MAX_WASM_BINARY_BYTES) return false;
+
   return (
-    binary[0] === WASM_MAGIC[0] &&
-    binary[1] === WASM_MAGIC[1] &&
-    binary[2] === WASM_MAGIC[2] &&
-    binary[3] === WASM_MAGIC[3] &&
-    binary[4] === WASM_VERSION_1[0] &&
-    binary[5] === WASM_VERSION_1[1] &&
-    binary[6] === WASM_VERSION_1[2] &&
-    binary[7] === WASM_VERSION_1[3]
+    bytes[0] === WASM_MAGIC[0] &&
+    bytes[1] === WASM_MAGIC[1] &&
+    bytes[2] === WASM_MAGIC[2] &&
+    bytes[3] === WASM_MAGIC[3] &&
+    bytes[4] === WASM_VERSION_1[0] &&
+    bytes[5] === WASM_VERSION_1[1] &&
+    bytes[6] === WASM_VERSION_1[2] &&
+    bytes[7] === WASM_VERSION_1[3]
   );
 }
 
@@ -77,17 +101,37 @@ function createInfiniteLoopWasm() {
 
 /**
  * WasmEngine provides safe, bounded execution of WebAssembly compute shards.
- * Enforces memory upper bounds, execution timeouts, and strict capability sandboxing
- * with zero external dependencies.
+ * Enforces memory upper bounds, execution timeouts, LRU module compilation caching,
+ * and strict capability sandboxing with zero external dependencies.
  */
 class WasmEngine extends EventEmitter {
   constructor(options = {}) {
     super();
     this.options = options;
-    this.maxExecutionMs = options.maxExecutionMs || DEFAULT_MAX_EXECUTION_MS;
-    this.initialPages = options.initialPages || DEFAULT_INITIAL_PAGES;
-    this.maxPages = options.maxPages || DEFAULT_MAX_PAGES;
+    this.maxExecutionMs =
+      typeof options.maxExecutionMs === 'number' && options.maxExecutionMs > 0
+        ? options.maxExecutionMs
+        : DEFAULT_MAX_EXECUTION_MS;
+
+    this.initialPages =
+      Number.isInteger(options.initialPages) && options.initialPages >= 0
+        ? options.initialPages
+        : DEFAULT_INITIAL_PAGES;
+
+    this.maxPages =
+      Number.isInteger(options.maxPages) && options.maxPages >= 0
+        ? options.maxPages
+        : DEFAULT_MAX_PAGES;
+
     this.allowEnvImports = Boolean(options.allowEnvImports);
+
+    this.maxCacheEntries =
+      Number.isInteger(options.maxCacheEntries) && options.maxCacheEntries > 0
+        ? options.maxCacheEntries
+        : DEFAULT_MAX_CACHE_ENTRIES;
+
+    // Cryptographically keyed LRU cache for compiled WebAssembly.Module instances
+    this._moduleCache = new Map();
 
     if (typeof WebAssembly === 'undefined') {
       throw new Error('WebAssembly is not supported in this Node environment');
@@ -96,18 +140,55 @@ class WasmEngine extends EventEmitter {
 
   /**
    * Compiles and validates a WebAssembly module from binary bytes.
-   * @param {Buffer|Uint8Array} binary
+   * Utilizes a SHA-256 keyed bounded LRU cache to prevent repeated compilation
+   * overhead while guarding against cache poisoning and unbounded memory growth.
+   * @param {Buffer|Uint8Array|ArrayBuffer} binary
    * @returns {WebAssembly.Module}
    */
   compileModule(binary) {
     if (!isValidWasmHeader(binary)) {
       throw new Error('Invalid WebAssembly binary: missing or invalid magic header');
     }
+
+    const hash = crypto.createHash('sha256').update(binary).digest('hex');
+    if (this._moduleCache.has(hash)) {
+      const cached = this._moduleCache.get(hash);
+      // Refresh LRU ordering
+      this._moduleCache.delete(hash);
+      this._moduleCache.set(hash, cached);
+      return cached;
+    }
+
     try {
-      return new WebAssembly.Module(binary);
+      const mod = new WebAssembly.Module(binary);
+      // Bounded LRU eviction
+      if (this._moduleCache.size >= this.maxCacheEntries) {
+        const oldestKey = this._moduleCache.keys().next().value;
+        this._moduleCache.delete(oldestKey);
+      }
+      this._moduleCache.set(hash, mod);
+      return mod;
     } catch (err) {
       throw new Error(`WebAssembly compilation failed: ${err.message}`);
     }
+  }
+
+  /**
+   * Clears the compiled module cache.
+   */
+  clearCache() {
+    this._moduleCache.clear();
+  }
+
+  /**
+   * Returns current cache statistics.
+   * @returns {{ size: number, maxCacheEntries: number }}
+   */
+  getCacheStats() {
+    return {
+      size: this._moduleCache.size,
+      maxCacheEntries: this.maxCacheEntries
+    };
   }
 
   /**
@@ -117,9 +198,19 @@ class WasmEngine extends EventEmitter {
    * @returns {WebAssembly.Memory}
    */
   createSandboxedMemory(initialPages = this.initialPages, maxPages = this.maxPages) {
+    if (!Number.isInteger(initialPages) || initialPages < 0) {
+      throw new RangeError(`initialPages (${initialPages}) must be a non-negative integer`);
+    }
+    if (!Number.isInteger(maxPages) || maxPages < 0) {
+      throw new RangeError(`maxPages (${maxPages}) must be a non-negative integer`);
+    }
     if (initialPages > maxPages) {
       throw new RangeError(`initialPages (${initialPages}) cannot exceed maxPages (${maxPages})`);
     }
+    if (maxPages > MAX_ALLOWED_PAGES) {
+      throw new RangeError(`maxPages (${maxPages}) cannot exceed specification ceiling (${MAX_ALLOWED_PAGES})`);
+    }
+
     return new WebAssembly.Memory({
       initial: initialPages,
       maximum: maxPages
@@ -128,18 +219,30 @@ class WasmEngine extends EventEmitter {
 
   /**
    * Builds safe import object restricting host access.
-   * Prevents WASI or host system calls unless explicitly configured.
+   * Deeply merges `js` imports to preserve `js.mem` and strips ambient `env`.
    * @param {object} customImports
    * @param {WebAssembly.Memory} memory
    * @returns {object}
    */
   createSafeImports(customImports = {}, memory = null) {
+    const sandboxedMem = memory || this.createSandboxedMemory();
+    const customJs =
+      customImports && typeof customImports.js === 'object' && customImports.js !== null
+        ? customImports.js
+        : {};
+
     const imports = {
+      ...customImports,
       js: {
-        mem: memory || this.createSandboxedMemory()
-      },
-      ...customImports
+        mem: sandboxedMem,
+        ...customJs
+      }
     };
+
+    // Ensure sandboxed memory is preserved unless customImports explicitly provided mem
+    if (!customJs.mem) {
+      imports.js.mem = sandboxedMem;
+    }
 
     if (!this.allowEnvImports) {
       // Disallow ambient process/file/network access inside imports
@@ -151,21 +254,35 @@ class WasmEngine extends EventEmitter {
 
   /**
    * Instantiates a WebAssembly module with sandboxed memory and import boundaries.
+   * Validates internal module memory declarations against maxPages upper limits.
    * @param {Buffer|Uint8Array|WebAssembly.Module} moduleOrBinary
    * @param {object} [customImports]
    * @returns {{ instance: WebAssembly.Instance, memory: WebAssembly.Memory }}
    */
   instantiate(moduleOrBinary, customImports = {}) {
-    const mod = moduleOrBinary instanceof WebAssembly.Module
-      ? moduleOrBinary
-      : this.compileModule(moduleOrBinary);
+    const mod =
+      moduleOrBinary instanceof WebAssembly.Module
+        ? moduleOrBinary
+        : this.compileModule(moduleOrBinary);
 
     const memory = this.createSandboxedMemory();
     const imports = this.createSafeImports(customImports, memory);
 
     try {
       const instance = new WebAssembly.Instance(mod, imports);
-      return { instance, memory };
+
+      // Verify and capture internal module memory if declared
+      let activeMemory = memory;
+      if (instance.exports.memory && instance.exports.memory instanceof WebAssembly.Memory) {
+        activeMemory = instance.exports.memory;
+        if (activeMemory.buffer.byteLength > this.maxPages * WASM_PAGE_SIZE) {
+          throw new RangeError(
+            `Module internal memory (${activeMemory.buffer.byteLength} bytes) exceeds maxPages limit (${this.maxPages * WASM_PAGE_SIZE} bytes)`
+          );
+        }
+      }
+
+      return { instance, memory: activeMemory };
     } catch (err) {
       throw new Error(`WebAssembly instantiation failed: ${err.message}`);
     }
@@ -173,6 +290,7 @@ class WasmEngine extends EventEmitter {
 
   /**
    * Executes an exported WebAssembly function synchronously with timeout and memory tracking.
+   * Traps synchronous runaway infinite loops fail-closed using isolated V8 VM watchdog timeouts.
    * @param {Buffer|Uint8Array|WebAssembly.Module} moduleOrBinary
    * @param {string} exportName
    * @param {Array<number>} [args]
@@ -180,6 +298,13 @@ class WasmEngine extends EventEmitter {
    * @returns {{ output: any, executionTimeMs: number, memoryBytes: number }}
    */
   execute(moduleOrBinary, exportName, args = [], options = {}) {
+    if (typeof exportName !== 'string' || !exportName.trim()) {
+      throw new TypeError("Invalid exportName: must be a non-empty string");
+    }
+    if (!Array.isArray(args)) {
+      throw new TypeError("Invalid args: must be an array");
+    }
+
     const { instance, memory } = this.instantiate(moduleOrBinary, options.imports);
     const fn = instance.exports[exportName];
 
@@ -187,13 +312,25 @@ class WasmEngine extends EventEmitter {
       throw new Error(`Export '${exportName}' is not a callable function in WebAssembly module`);
     }
 
-    const maxMs = options.maxExecutionMs || this.maxExecutionMs;
-    const startTime = performance.now();
+    const maxMs =
+      options && typeof options.maxExecutionMs === 'number' && options.maxExecutionMs > 0
+        ? options.maxExecutionMs
+        : this.maxExecutionMs;
 
+    const startTime = performance.now();
     let output;
+
+    // Execute within a VM context to enforce strict synchronous timeout interrupts on loops
+    const sandbox = { fn, args, output: undefined };
+    const context = vm.createContext(sandbox);
+
     try {
-      output = fn(...args);
+      vm.runInContext('output = fn(...args);', context, { timeout: maxMs });
+      output = sandbox.output;
     } catch (err) {
+      if (err.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT' || /timed out/i.test(err.message)) {
+        throw new Error(`WebAssembly execution timeout: exceeded ${maxMs}ms`);
+      }
       throw new Error(`WebAssembly execution error in '${exportName}': ${err.message}`);
     }
 
@@ -219,8 +356,20 @@ class WasmEngine extends EventEmitter {
         return reject(new TypeError('Invalid shard: must be an object'));
       }
       const { shardId, wasmBinary, exportName = 'main', args = [], timeoutMs } = shard;
-      if (!shardId) {
+      if (!shardId || typeof shardId !== 'string') {
         return reject(new TypeError('Invalid shard: missing shardId'));
+      }
+      if (typeof exportName !== 'string' || !exportName.trim()) {
+        return reject(new TypeError('Invalid shard: exportName must be a non-empty string'));
+      }
+      if (!Array.isArray(args)) {
+        return reject(new TypeError('Invalid shard: args must be an array'));
+      }
+      if (
+        timeoutMs !== undefined &&
+        (typeof timeoutMs !== 'number' || Number.isNaN(timeoutMs) || timeoutMs <= 0)
+      ) {
+        return reject(new TypeError('Invalid shard: timeoutMs must be a positive number'));
       }
       if (!isValidWasmHeader(wasmBinary)) {
         return reject(new Error('Invalid WebAssembly binary: missing magic header'));
@@ -312,9 +461,7 @@ class WasmEngine extends EventEmitter {
       worker.on('exit', (code) => {
         if (settled) return;
         cleanup();
-        if (code !== 0) {
-          reject(new Error(`WASM worker stopped unexpectedly with exit code ${code}`));
-        }
+        reject(new Error(`WASM worker stopped unexpectedly with exit code ${code}`));
       });
     });
   }
@@ -328,5 +475,7 @@ module.exports = {
   WASM_PAGE_SIZE,
   DEFAULT_INITIAL_PAGES,
   DEFAULT_MAX_PAGES,
-  DEFAULT_MAX_EXECUTION_MS
+  MAX_ALLOWED_PAGES,
+  DEFAULT_MAX_EXECUTION_MS,
+  DEFAULT_MAX_CACHE_ENTRIES
 };

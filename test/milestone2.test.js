@@ -1,7 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const crypto = require('node:crypto');
-const http = require('node:http');
+const os = require('node:os');
+const path = require('node:path');
 
 const {
   WebSocketConnection,
@@ -11,6 +12,7 @@ const {
   FrameParser,
   OPCODES
 } = require('../src/transport/websocket');
+const { MeshCryptoEngine } = require('../src/crypto');
 const { GridRouter } = require('../src/router');
 const { ComputeSea } = require('../src');
 
@@ -19,7 +21,7 @@ function makeUniqueIpcPath(tag = 'ws-test') {
   if (process.platform === 'win32') {
     return `\\\\.\\pipe\\openside-ws-${tag}-${suffix}`;
   }
-  return `/tmp/openside-ws-${tag}-${suffix}.sock`;
+  return path.join(os.tmpdir(), `openside-ws-${tag}-${suffix.slice(0, 8)}.sock`);
 }
 
 // ============================================================================
@@ -126,7 +128,9 @@ test('WebSocket: Full Client-Server Handshake, Bidirectional Messaging, Ping/Pon
   assert.strictEqual(reply, 'ACK:sea-shard-task-alpha');
   assert.ok(serverGotPing);
 
+  const clientClosed = new Promise((resolve) => client.on('close', resolve));
   client.close();
+  await clientClosed;
   await wss.close();
 });
 
@@ -336,4 +340,343 @@ test('WebSocket: RFC 6455 Protocol Violations & Error State Transitions', async 
   preClient.close();
   assert.strictEqual(preCloseEmitted, true);
   assert.strictEqual(preClient.readyState, 3);
+});
+
+// ============================================================================
+// Extended Encrypted Payload & Crypto Edge-Case Coverage
+// ============================================================================
+
+test('WebSocket: Authenticated AES-256-GCM Shard Transmission (Text & Binary Frames)', async () => {
+  const coordCrypto = new MeshCryptoEngine();
+  const workerCrypto = new MeshCryptoEngine();
+
+  const coordSessionKey = coordCrypto.deriveSessionKey(workerCrypto.publicKey, { epoch: 1 });
+  const workerSessionKey = workerCrypto.deriveSessionKey(coordCrypto.publicKey, { epoch: 1 });
+
+  const ipcPath = makeUniqueIpcPath('ws-crypto-bidirectional');
+  const wss = new WebSocketServer();
+  await wss.listen(ipcPath);
+
+  let serverDecryptedShard = null;
+  let serverDecryptedBinary = null;
+
+  wss.on('connection', (ws) => {
+    ws.on('message', (msg, isBinary) => {
+      if (!isBinary) {
+        // Text frame: JSON encrypted packet
+        const encryptedPacket = JSON.parse(msg.toString('utf8'));
+        serverDecryptedShard = workerCrypto.decryptShard(encryptedPacket, workerSessionKey, {
+          validateReplay: true,
+          senderId: coordCrypto.nodeId,
+          aad: `${coordCrypto.nodeId}:${encryptedPacket.shardId || 'shard-001'}`
+        });
+
+        // Send encrypted response back as text frame
+        const responsePacket = workerCrypto.encryptShard(
+          { shardId: serverDecryptedShard.shardId, result: 42, status: 'SUCCESS' },
+          workerSessionKey,
+          { epoch: 1, aad: `${workerCrypto.nodeId}:${serverDecryptedShard.shardId}:res` }
+        );
+        ws.send(JSON.stringify(responsePacket));
+      } else {
+        // Binary frame: raw binary ciphertext or bytes
+        const rawCiphertext = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
+        serverDecryptedBinary = rawCiphertext;
+        ws.send(Buffer.from('BINARY_ACK'));
+      }
+    });
+  });
+
+  const client = new WebSocketClient('ws://localhost/crypto', { socketPath: ipcPath });
+  await new Promise((resolve) => client.on('open', resolve));
+
+  // 1. Send encrypted shard via Text Frame
+  const shardPayload = { shardId: 'shard-001', task: 'compute-pi', data: [1, 2, 3] };
+  const aad = `${coordCrypto.nodeId}:shard-001`;
+  const encryptedPacket = coordCrypto.encryptShard(shardPayload, coordSessionKey, { epoch: 1, aad });
+
+  const replyPromise = new Promise((resolve) => {
+    client.once('message', (data) => resolve(JSON.parse(data.toString('utf8'))));
+  });
+
+  client.send(JSON.stringify(encryptedPacket));
+  const replyPacket = await replyPromise;
+
+  const decryptedResult = coordCrypto.decryptShard(replyPacket, coordSessionKey, {
+    validateReplay: true,
+    senderId: workerCrypto.nodeId,
+    aad: `${workerCrypto.nodeId}:shard-001:res`
+  });
+
+  assert.strictEqual(serverDecryptedShard.shardId, 'shard-001');
+  assert.deepStrictEqual(serverDecryptedShard.data, [1, 2, 3]);
+  assert.strictEqual(decryptedResult.result, 42);
+  assert.strictEqual(decryptedResult.status, 'SUCCESS');
+
+  // 2. Send encrypted binary frame
+  const binaryPayload = crypto.randomBytes(512);
+  const binaryReplyPromise = new Promise((resolve) => {
+    client.once('message', (data) => resolve(data.toString('utf8')));
+  });
+  client.send(binaryPayload);
+  const binaryReply = await binaryReplyPromise;
+  assert.strictEqual(binaryReply, 'BINARY_ACK');
+  assert.deepStrictEqual(serverDecryptedBinary, binaryPayload);
+
+  // Clean close
+  const clientClosed = new Promise((resolve) => client.on('close', resolve));
+  client.close();
+  await clientClosed;
+  await wss.close();
+});
+
+test('WebSocket: Ciphertext Tampering & Bit-Flipping Fail-Closed Detection', () => {
+  const coordCrypto = new MeshCryptoEngine();
+  const workerCrypto = new MeshCryptoEngine();
+
+  const coordSessionKey = coordCrypto.deriveSessionKey(workerCrypto.publicKey, { epoch: 1 });
+  const workerSessionKey = workerCrypto.deriveSessionKey(coordCrypto.publicKey, { epoch: 1 });
+
+  const shardPayload = { shardId: 'shard-sec-99', sensitiveCommand: 'transfer' };
+  const packet = coordCrypto.encryptShard(shardPayload, coordSessionKey, { epoch: 1 });
+
+  // 1. Bit-flip in ciphertext
+  const tamperedCiphertext = Buffer.from(packet.ciphertext, 'hex');
+  tamperedCiphertext[0] ^= 0xFF;
+  const corruptedPkt1 = { ...packet, ciphertext: tamperedCiphertext.toString('hex') };
+  assert.throws(() => {
+    workerCrypto.decryptShard(corruptedPkt1, workerSessionKey);
+  }, /authentication tag verification failed/i);
+
+  // 2. Tampered authTag
+  const tamperedAuthTag = Buffer.from(packet.authTag, 'hex');
+  tamperedAuthTag[0] ^= 0x01;
+  const corruptedPkt2 = { ...packet, authTag: tamperedAuthTag.toString('hex') };
+  assert.throws(() => {
+    workerCrypto.decryptShard(corruptedPkt2, workerSessionKey);
+  }, /authentication tag verification failed/i);
+
+  // 3. Truncated / malformed IV
+  const corruptedPkt3 = { ...packet, iv: 'abcd' };
+  assert.throws(() => {
+    workerCrypto.decryptShard(corruptedPkt3, workerSessionKey);
+  }, /malformed IV/i);
+
+  // 4. Verification over WebSocket Frame Parser
+  const frame = encodeFrame(JSON.stringify(corruptedPkt1), { opcode: OPCODES.TEXT, mask: true });
+  const parser = new FrameParser();
+  const [parsed] = parser.push(frame);
+  assert.ok(parsed);
+  assert.throws(() => {
+    const pkt = JSON.parse(parsed.payload.toString('utf8'));
+    workerCrypto.decryptShard(pkt, workerSessionKey);
+  }, /authentication tag verification failed/i);
+});
+
+test('WebSocket: RFC 6455 Multi-Frame CONTINUATION Fragmentation of Encrypted Shards', () => {
+  const coordCrypto = new MeshCryptoEngine();
+  const workerCrypto = new MeshCryptoEngine();
+
+  const coordSessionKey = coordCrypto.deriveSessionKey(workerCrypto.publicKey, { epoch: 1 });
+  const workerSessionKey = workerCrypto.deriveSessionKey(coordCrypto.publicKey, { epoch: 1 });
+
+  // Create a large shard payload
+  const largeData = Array.from({ length: 1500 }, (_, i) => ({ id: i, val: `entry-${i}-` + 'x'.repeat(20) }));
+  const shard = { shardId: 'shard-frag-01', data: largeData };
+  const aad = `${coordCrypto.nodeId}:shard-frag-01`;
+  const packet = coordCrypto.encryptShard(shard, coordSessionKey, { epoch: 1, aad });
+  const serialized = Buffer.from(JSON.stringify(packet), 'utf8');
+
+  // Split serialized into 3 fragments
+  const part1 = serialized.subarray(0, 10000);
+  const part2 = serialized.subarray(10000, 25000);
+  const part3 = serialized.subarray(25000);
+
+  // Frame 1: Opcode TEXT, FIN = false
+  const frame1 = encodeFrame(part1, { opcode: OPCODES.TEXT, fin: false, mask: true });
+  // Frame 2: Opcode CONTINUATION, FIN = false
+  const frame2 = encodeFrame(part2, { opcode: OPCODES.CONTINUATION, fin: false, mask: true });
+  // Frame 3: Opcode CONTINUATION, FIN = true
+  const frame3 = encodeFrame(part3, { opcode: OPCODES.CONTINUATION, fin: true, mask: true });
+
+  const mockSocket = new (require('node:events').EventEmitter)();
+  mockSocket.destroyed = false;
+  mockSocket.writable = true;
+  mockSocket.write = () => true;
+  mockSocket.end = () => {};
+  mockSocket.destroy = () => {};
+
+  const serverConn = new WebSocketConnection(mockSocket, true);
+  let reassembledMessage = null;
+  serverConn.on('message', (msg) => {
+    reassembledMessage = msg;
+  });
+
+  // Push frames in sequence
+  mockSocket.emit('data', frame1);
+  assert.strictEqual(reassembledMessage, null); // Not complete yet
+
+  mockSocket.emit('data', frame2);
+  assert.strictEqual(reassembledMessage, null); // Still not complete
+
+  mockSocket.emit('data', frame3);
+  assert.ok(reassembledMessage); // Reassembly complete on FIN=true
+
+  // Decrypt and verify full integrity
+  const parsedPkt = JSON.parse(reassembledMessage.toString('utf8'));
+  const decrypted = workerCrypto.decryptShard(parsedPkt, workerSessionKey, {
+    validateReplay: true,
+    senderId: coordCrypto.nodeId,
+    aad
+  });
+
+  assert.strictEqual(decrypted.shardId, 'shard-frag-01');
+  assert.strictEqual(decrypted.data.length, 1500);
+  assert.deepStrictEqual(decrypted.data[0], { id: 0, val: 'entry-0-' + 'x'.repeat(20) });
+});
+
+test('WebSocket: Anti-Replay Attack Protection & AAD Binding Enforcement', () => {
+  const coordCrypto = new MeshCryptoEngine();
+  const workerCrypto = new MeshCryptoEngine();
+
+  const coordSessionKey = coordCrypto.deriveSessionKey(workerCrypto.publicKey, { epoch: 1 });
+  const workerSessionKey = workerCrypto.deriveSessionKey(coordCrypto.publicKey, { epoch: 1 });
+
+  const shardPayload = { shardId: 'shard-replay-01', amount: 1000 };
+  const aad = `${coordCrypto.nodeId}:shard-replay-01`;
+
+  const packet1 = coordCrypto.encryptShard(shardPayload, coordSessionKey, { nonce: 1, aad });
+
+  // 1. Initial valid decryption passes with anti-replay
+  const decrypted1 = workerCrypto.decryptShard(packet1, workerSessionKey, {
+    validateReplay: true,
+    senderId: coordCrypto.nodeId,
+    aad
+  });
+  assert.strictEqual(decrypted1.shardId, 'shard-replay-01');
+
+  // 2. Replay attack with identical packet fails
+  assert.throws(() => {
+    workerCrypto.decryptShard(packet1, workerSessionKey, {
+      validateReplay: true,
+      senderId: coordCrypto.nodeId,
+      aad
+    });
+  }, /replay.*detected/i);
+
+  // 3. AAD binding tampering fails
+  const packet2 = coordCrypto.encryptShard(shardPayload, coordSessionKey, { nonce: 2, aad });
+  assert.throws(() => {
+    workerCrypto.decryptShard(packet2, workerSessionKey, {
+      validateReplay: true,
+      senderId: coordCrypto.nodeId,
+      aad: `${coordCrypto.nodeId}:wrong-shard-id`
+    });
+  }, /authentication tag verification failed/i);
+});
+
+test('Router: Dead-Peer Re-dispatch Performs Cryptographic Re-Encryption with Backup Key', () => {
+  let virtualTime = 300000;
+  const router = new GridRouter('coord-node', {
+    now: () => virtualTime,
+    heartbeatIntervalMs: 5000,
+    deadPeerTimeoutMs: 15000
+  });
+
+  const coordCrypto = new MeshCryptoEngine();
+  const dyingWorkerCrypto = new MeshCryptoEngine();
+  const backupWorkerCrypto = new MeshCryptoEngine();
+
+  const dyingSessionKey = coordCrypto.deriveSessionKey(dyingWorkerCrypto.publicKey, { epoch: 1 });
+  const backupSessionKey = coordCrypto.deriveSessionKey(backupWorkerCrypto.publicKey, { epoch: 1 });
+
+  router.registerPeer(dyingWorkerCrypto.nodeId, dyingWorkerCrypto.publicKey, { standbyReady: true, latencyMs: 5 });
+  router.registerPeer(backupWorkerCrypto.nodeId, backupWorkerCrypto.publicKey, { standbyReady: true, latencyMs: 15 });
+
+  const shard = {
+    shardId: 'shard-redispatch-01',
+    taskCode: 'return data * 3;',
+    inputData: 10
+  };
+
+  // Dispatch to lowest latency peer (dying)
+  const dispatchRes = router.dispatchShard(shard);
+  assert.strictEqual(dispatchRes.status, 'DISPATCHED');
+  assert.strictEqual(dispatchRes.peer.nodeId, dyingWorkerCrypto.nodeId);
+
+  // Encrypt shard for dying worker
+  const dyingPacket = coordCrypto.encryptShard(shard, dyingSessionKey, {
+    epoch: 1,
+    aad: `${coordCrypto.nodeId}:${shard.shardId}`
+  });
+
+  // Verify backup worker cannot decrypt dying worker's packet
+  const backupWorkerSessionKey = backupWorkerCrypto.deriveSessionKey(coordCrypto.publicKey, { epoch: 1 });
+  assert.throws(() => {
+    backupWorkerCrypto.decryptShard(dyingPacket, backupWorkerSessionKey);
+  }, /authentication tag verification failed/i);
+
+  // Advance time: dying worker times out
+  virtualTime += 16000;
+  router.recordHeartbeatPong(backupWorkerCrypto.nodeId);
+
+  // Run dead-peer check
+  const check = router.checkHeartbeats();
+  assert.deepStrictEqual(check.deadPeers, [dyingWorkerCrypto.nodeId]);
+
+  // Shard re-routed to backup
+  const inFlight = router.inFlightShards.get('shard-redispatch-01');
+  assert.ok(inFlight);
+  assert.strictEqual(inFlight.peerId, backupWorkerCrypto.nodeId);
+
+  // Coordinator re-encrypts with backup session key
+  const backupPacket = coordCrypto.encryptShard(shard, backupSessionKey, {
+    epoch: 1,
+    aad: `${coordCrypto.nodeId}:${shard.shardId}`
+  });
+
+  // Backup worker decrypts successfully
+  const decryptedShard = backupWorkerCrypto.decryptShard(backupPacket, backupWorkerSessionKey, {
+    validateReplay: true,
+    senderId: coordCrypto.nodeId,
+    aad: `${coordCrypto.nodeId}:${shard.shardId}`
+  });
+  assert.strictEqual(decryptedShard.shardId, 'shard-redispatch-01');
+  assert.strictEqual(decryptedShard.inputData, 10);
+
+  router.stopHeartbeatMonitor();
+});
+
+test('ComputeSea: Graceful Teardown Drains Encrypted Shards with Validated PoC Signatures', async () => {
+  const sea = new ComputeSea({
+    enableP2P: false,
+    handleSignals: false,
+    teardownGracePeriodMs: 2000
+  });
+
+  const workerCrypto = new MeshCryptoEngine();
+  const worker = await sea.addLocalWorker({
+    latencyMs: 5,
+    crypto: workerCrypto
+  });
+
+  const workloadPromise = sea.submitWorkload(
+    'return data.map(x => x * 100);',
+    [1, 2, 3, 4],
+    { chunkSize: 2 }
+  );
+
+  let teardownCompleted = false;
+  sea.on('teardownComplete', () => {
+    teardownCompleted = true;
+  });
+
+  const teardownPromise = sea.gracefulTeardown(2000, 'SIGTERM');
+  const [res, teardownRes] = await Promise.all([workloadPromise, teardownPromise]);
+
+  assert.strictEqual(res.status, 'COMPLETED');
+  assert.deepStrictEqual(res.output, [100, 200, 300, 400]);
+  assert.strictEqual(teardownRes.drained, true);
+  assert.strictEqual(teardownRes.remainingShards, 0);
+  assert.strictEqual(teardownCompleted, true);
 });

@@ -2,10 +2,10 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18.0.0-green.svg)](https://nodejs.org/)
-[![Architecture](https://img.shields.io/badge/Architecture-Single%20Compute%20Sea%20v1.0.0-purple.svg)]()
-[![Security](https://img.shields.io/badge/Crypto-ECDH%20%2B%20HKDF--SHA512%20%2B%20AES--256--GCM-red.svg)]()
+[![Architecture](https://img.shields.io/badge/Architecture-Single%20Compute%20Sea%20v0.9.0--beta-purple.svg)](#-single-compute-sea-architecture)
+[![Security](https://img.shields.io/badge/Crypto-ECDH%20%2B%20HKDF--SHA512%20%2B%20AES--256--GCM-red.svg)](./SECURITY.md)
 [![Roadmap](https://img.shields.io/badge/Roadmap-ROADMAP.md-blueviolet.svg)](./ROADMAP.md)
-[![Zero-Dependency](https://img.shields.io/badge/Dependencies-0%20Zero-brightgreen.svg)]()
+[![Zero-Dependency](https://img.shields.io/badge/Dependencies-0%20Zero-brightgreen.svg)](./package.json)
 
 **Open-Side** implements the **Single Compute Sea** universal protocol standard: a hardware-agnostic, zero-dependency decentralized peer-to-peer (P2P) compute backbone that pools idle standby hardware into a zero-trust, encrypted execution mesh built exclusively on native Node.js core APIs (`node:crypto`, `node:vm`, `node:worker_threads`, `node:net`, `node:os`, `node:events`, `node:v8`, `node:http`, `node:test`, `node:assert`).
 
@@ -78,11 +78,11 @@ graph TD
     - Hard memory bounding via `WebAssembly.Memory` page limits and millisecond execution timeout guards.
     - Zero-dependency synthetic WASM generation for deterministic micro-benchmarking and test verification.
 
-11. **Headless Daemon & Cluster Orchestrator (`src/daemon.js` — `DaemonMaster`)**
+11. **Headless Daemon & Cluster Orchestrator (`src/daemon.js` — `OpenSideDaemon`)**
     - Production-grade OS daemon with atomic PID file tracking, rotating log streams, and OS service signal handling (`SIGTERM`/`SIGINT`).
     - Native `node:cluster` multi-process orchestrator unlocking 100% multi-core CPU task parallelism with automatic worker self-healing.
 
-12. **Multiplexed Streams & Batch Shard Pipelining (`src/node.js` — `P2PStream`, `dispatchPipelinedBatch`)**
+12. **Multiplexed Streams & Batch Shard Pipelining (`src/node.js` — `P2PStream`, `P2PNode.prototype.dispatchPipelinedBatch`)**
     - 2-byte stream framing (`STREAM_FRAME_TAG: 0x03`) and duplex stream demuxing allowing multiple concurrent shards over a single TCP connection without head-of-line blocking.
     - Concurrent pipelined batch dispatching over the wire.
 
@@ -90,11 +90,11 @@ graph TD
     - RFC 5389 compliant STUN client over `node:dgram` with XOR-MAPPED-ADDRESS decoding across IPv4 and IPv6.
     - Multi-server NAT mapping classifier (`FULL_CONE`, `SYMMETRIC`, `OPEN_INTERNET`) and UDP hole-punching coordination for P2P connection behind domestic firewalls.
 
-14. **Redundant Shard Dispatch & Majority Consensus Voting (`src/router.js` — `evaluateConsensus`)**
+14. **Redundant Shard Dispatch & Majority Consensus Voting (`src/router.js` — `GridRouter.prototype.evaluateConsensus`)**
     - Byzantine fault-tolerant majority consensus voting on redundant shard outputs (2-of-3 agreement).
     - Automatic reputation reward for consensus participants and slashing for dissenting/faulty nodes.
 
-15. **Dynamic Tiered Scheduling & Peer Reputation (`src/router.js` — `updatePeerReputation`)**
+15. **Dynamic Tiered Scheduling & Peer Reputation (`src/router.js` — `GridRouter.prototype.updatePeerReputation`)**
     - Dynamic node classification: Tier 1 (High-Performance Data Centers), Tier 2 (Workstations/Desktops), Tier 3 (Edge/Low-RAM).
     - Reliability-weighted optimal node selection prioritizing top reputation peers.
 
@@ -136,7 +136,9 @@ Open-Side/
 │   ├── wasm.test.js           # WebAssembly memory bounds, execution & timeout tests
 │   ├── multiplex.test.js      # Stream multiplexing & batch pipelining tests
 │   ├── nat.test.js            # RFC 5389 STUN, XOR mapping & hole punching tests
-│   └── consensus_tiering.test.js # Byzantine consensus voting & peer tiering tests
+│   ├── consensus_tiering.test.js # Byzantine consensus voting & peer tiering tests
+│   └── regression_a1_microtask.test.js # Microtask queue VM timeout escape regression tests
+├── LICENSE                    # MIT License
 ├── package.json               # CommonJS, zero external dependencies
 ├── README.md
 └── SECURITY.md
@@ -162,7 +164,11 @@ node --test
 ```
 
 ### 3. Syntax Validation Across All Modules
-Each module must be checked individually with `node --check` (Node validates only the first script argument per `--check` invocation):
+Validate syntax across all 13 modules using the cross-platform npm script:
+```bash
+npm run check
+```
+Or check each module individually with `node --check` (Node validates only the first script argument per `--check` invocation):
 ```bash
 node --check src/index.js
 node --check src/crypto.js
@@ -171,6 +177,12 @@ node --check src/router.js
 node --check src/node.js
 node --check src/ledger.js
 node --check src/gateway.js
+node --check src/checkpoint.js
+node --check src/dht.js
+node --check src/wasm.js
+node --check src/daemon.js
+node --check src/transport/websocket.js
+node --check src/transport/nat.js
 ```
 
 ---

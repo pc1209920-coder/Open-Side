@@ -152,10 +152,15 @@ class MeshCryptoEngine {
    */
   validatePublicKey(peerPublicKeyHex) {
     const pubKeyBuf = this._decodePeerPublicKeyHex(peerPublicKeyHex);
+    let secret;
     try {
-      this.ecdh.computeSecret(pubKeyBuf);
+      secret = this.ecdh.computeSecret(pubKeyBuf);
     } catch (err) {
       throw new Error(`Key derivation failed: invalid elliptic curve public key (${err.message})`);
+    } finally {
+      if (secret && Buffer.isBuffer(secret)) {
+        secret.fill(0);
+      }
     }
     return true;
   }
@@ -163,6 +168,7 @@ class MeshCryptoEngine {
   /**
    * Baseline shared key derivation (SHA-256 digest of ECDH secret).
    * 100% backward compatible with v0.4.2 baseline.
+   * Zeroizes raw ECDH secret after hashing to prevent key retention in memory.
    * @param {string} peerPublicKeyHex
    * @returns {Buffer} 32-byte shared key buffer
    */
@@ -171,15 +177,20 @@ class MeshCryptoEngine {
     let rawSecret;
     try {
       rawSecret = this.ecdh.computeSecret(pubKeyBuf);
+      return crypto.createHash('sha256').update(rawSecret).digest();
     } catch (err) {
       throw new Error(`Key derivation failed: invalid elliptic curve public key (${err.message})`);
+    } finally {
+      if (rawSecret && Buffer.isBuffer(rawSecret)) {
+        rawSecret.fill(0);
+      }
     }
-    return crypto.createHash('sha256').update(rawSecret).digest();
   }
 
   /**
    * Requirement R3: HKDF-SHA512 session key derivation and epoch rotation.
    * Derives a fresh symmetric key from ECDH shared secret using HKDF-SHA512.
+   * Zeroizes raw ECDH secret after derivation to prevent key retention in memory.
    * @param {string} peerPublicKeyHex
    * @param {object} [options]
    * @param {Buffer|string} [options.salt]
@@ -195,35 +206,46 @@ class MeshCryptoEngine {
     if (!Number.isSafeInteger(keylen) || keylen <= 0 || keylen > MAX_HKDF_SHA512_KEYLEN) {
       throw new RangeError(`Invalid key length: must be an integer between 1 and ${MAX_HKDF_SHA512_KEYLEN}`);
     }
+    if (opts.epoch !== undefined) {
+      if (typeof opts.epoch !== 'number' || !Number.isSafeInteger(opts.epoch) || opts.epoch < 0) {
+        throw new TypeError('Invalid epoch: must be a non-negative safe integer');
+      }
+    }
 
     let rawSecret;
     try {
-      rawSecret = this.ecdh.computeSecret(pubKeyBuf);
-    } catch (err) {
-      throw new Error(`Key derivation failed: invalid elliptic curve public key (${err.message})`);
-    }
+      try {
+        rawSecret = this.ecdh.computeSecret(pubKeyBuf);
+      } catch (err) {
+        throw new Error(`Key derivation failed: invalid elliptic curve public key (${err.message})`);
+      }
 
-    const salt = (opts.salt !== undefined && opts.salt !== null)
-      ? (Buffer.isBuffer(opts.salt) ? opts.salt : Buffer.from(String(opts.salt), 'utf8'))
-      : Buffer.from(DEFAULT_HKDF_SALT, 'utf8');
+      const salt = (opts.salt !== undefined && opts.salt !== null)
+        ? (Buffer.isBuffer(opts.salt) ? opts.salt : Buffer.from(String(opts.salt), 'utf8'))
+        : Buffer.from(DEFAULT_HKDF_SALT, 'utf8');
 
-    let infoStr = DEFAULT_HKDF_INFO;
-    if (opts.info !== undefined && opts.info !== null) {
-      infoStr = opts.info;
-    } else if (opts.epoch !== undefined) {
-      infoStr = `open-side-v1-session-key-epoch:${opts.epoch}`;
-    }
-    let info = Buffer.isBuffer(infoStr) ? infoStr : Buffer.from(String(infoStr), 'utf8');
-    // OpenSSL caps raw HKDF info at 1024 bytes; domain-separated SHA-512 digest preserves arbitrary-length info entropy.
-    if (info.length > 1024) {
-      info = Buffer.concat([
-        Buffer.from('open-side:hkdf-info-sha512:', 'utf8'),
-        crypto.createHash('sha512').update(info).digest()
-      ]);
-    }
+      let infoStr = DEFAULT_HKDF_INFO;
+      if (opts.info !== undefined && opts.info !== null) {
+        infoStr = opts.info;
+      } else if (opts.epoch !== undefined) {
+        infoStr = `open-side-v1-session-key-epoch:${opts.epoch}`;
+      }
+      let info = Buffer.isBuffer(infoStr) ? infoStr : Buffer.from(String(infoStr), 'utf8');
+      // OpenSSL caps raw HKDF info at 1024 bytes; domain-separated SHA-512 digest preserves arbitrary-length info entropy.
+      if (info.length > 1024) {
+        info = Buffer.concat([
+          Buffer.from('open-side:hkdf-info-sha512:', 'utf8'),
+          crypto.createHash('sha512').update(info).digest()
+        ]);
+      }
 
-    const derivedArrayBuffer = crypto.hkdfSync('sha512', rawSecret, salt, info, keylen);
-    return Buffer.from(derivedArrayBuffer);
+      const derivedArrayBuffer = crypto.hkdfSync('sha512', rawSecret, salt, info, keylen);
+      return Buffer.from(derivedArrayBuffer);
+    } finally {
+      if (rawSecret && Buffer.isBuffer(rawSecret)) {
+        rawSecret.fill(0);
+      }
+    }
   }
 
   /**
@@ -247,6 +269,11 @@ class MeshCryptoEngine {
     }
 
     const opts = normalizeOptions(options);
+    if (opts.epoch !== undefined) {
+      if (typeof opts.epoch !== 'number' || !Number.isSafeInteger(opts.epoch) || opts.epoch < 0) {
+        throw new TypeError('Invalid epoch: must be a non-negative safe integer');
+      }
+    }
     let serialized;
     try {
       serialized = safeJsonStringify(payloadObj);
@@ -334,6 +361,11 @@ class MeshCryptoEngine {
     }
 
     const opts = normalizeOptions(options);
+    if (opts.epoch !== undefined) {
+      if (typeof opts.epoch !== 'number' || !Number.isSafeInteger(opts.epoch) || opts.epoch < 0) {
+        throw new TypeError('Invalid epoch: must be a non-negative safe integer');
+      }
+    }
 
     // Strict validation of IV (12 bytes = 24 hex characters)
     if (typeof encryptedPacket.iv !== 'string' || !/^[0-9a-fA-F]{24}$/.test(encryptedPacket.iv)) {
@@ -591,6 +623,11 @@ class MeshCryptoEngine {
    */
   validateWirePacket(packet, peerNodeId, options = {}) {
     const opts = normalizeOptions(options);
+    if (opts.epoch !== undefined) {
+      if (typeof opts.epoch !== 'number' || !Number.isSafeInteger(opts.epoch) || opts.epoch < 0) {
+        throw new TypeError('Invalid epoch: must be a non-negative safe integer');
+      }
+    }
     const evalResult = this._evaluateWirePacket(packet, peerNodeId, opts);
     if (!evalResult.ok) {
       const shouldThrow = opts.throwOnError !== undefined

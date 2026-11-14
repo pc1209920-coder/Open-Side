@@ -56,6 +56,9 @@ function probeLoopbackTcpAllowed() {
       resolve(allowed);
     };
 
+    const safetyTimer = setTimeout(() => finish(false), 1000);
+    if (typeof safetyTimer.unref === 'function') safetyTimer.unref();
+
     srv.once('error', () => finish(false));
     srv.listen({ host: '127.0.0.1', port: 0 }, () => {
       const addr = srv.address();
@@ -638,6 +641,129 @@ describe('Milestone 6 (F30): Anti-Replay Double-Spend Prevention & PoC Verificat
     const cleanRes = ledger.verifyAndSettle(params);
     assert.strictEqual(cleanRes.settled, true);
   });
+
+  test('F30.04: rejects replayed, consumed, and cross-account escrows fail-closed with zero balance mutations', () => {
+    const ledger = new ProofOfComputeLedger();
+    const requesterA = new MeshCryptoEngine();
+    const requesterB = new MeshCryptoEngine();
+    const worker = new MeshCryptoEngine();
+
+    ledger.createAccount(requesterA.nodeId, 200);
+    ledger.createAccount(requesterB.nodeId, 200);
+
+    const claim = makeSignedShardClaim(worker, requesterA.nodeId, 'return data.map(n => n + 1);', [1, 2], {
+      executionTimeMs: 50,
+      attestationNonce: 'escrow-replay-1'
+    });
+
+    const escrowA = ledger.reserveEscrow(requesterA.nodeId, 50, claim.shard.shardId);
+    assert.strictEqual(escrowA.reserved, 50);
+
+    // 1. Cross-account escrow usage rejected fail-closed
+    assert.throws(
+      () => ledger.verifyAndSettle({
+        ...claim.params,
+        requesterId: requesterB.nodeId,
+        escrowId: escrowA.escrowId
+      }),
+      /Escrow ownership mismatch/i
+    );
+    assert.strictEqual(ledger.getBalance(requesterA.nodeId), 200);
+    assert.strictEqual(ledger.getBalance(requesterB.nodeId), 200);
+
+    // 2. Consume escrow legitimately
+    const r1 = ledger.verifyAndSettle({ ...claim.params, escrowId: escrowA.escrowId });
+    assert.strictEqual(r1.settled, true);
+
+    const snapAfter = snapshotLedgerState(ledger);
+
+    // 3. Replay of consumed escrowId fails closed even with fresh valid signature
+    const claimNew = makeSignedShardClaim(worker, requesterA.nodeId, 'return data;', [3, 4], {
+      executionTimeMs: 20,
+      attestationNonce: 'escrow-replay-2'
+    });
+    assert.throws(
+      () => ledger.verifyAndSettle({
+        ...claimNew.params,
+        escrowId: escrowA.escrowId
+      }),
+      /Invalid or already consumed escrowId/i
+    );
+
+    // 4. Nonce re-use on consumed escrow fails closed via DoubleSpendAttemptError
+    assert.throws(
+      () => ledger.verifyAndSettle({
+        ...claimNew.params,
+        escrowId: escrowA.escrowId,
+        attestationNonce: 'escrow-replay-1'
+      }),
+      DoubleSpendAttemptError
+    );
+
+    assertLedgerStateUnchanged(ledger, snapAfter, 'after consumed escrow replay attempts');
+  });
+
+  test('F30.05: rejects invalid PoC payloads (malformed metrics, prototype pollution payloads, and status edge cases) fail-closed', () => {
+    const ledger = new ProofOfComputeLedger();
+    const requester = new MeshCryptoEngine();
+    const worker = new MeshCryptoEngine();
+    ledger.createAccount(requester.nodeId, 200);
+
+    const { shard, params } = makeSignedShardClaim(worker, requester.nodeId, 'return data;', [1, 2], {
+      executionTimeMs: 20,
+      attestationNonce: 'payload-edge-1'
+    });
+
+    // 1. Missing executionMetrics object
+    assert.throws(() => ledger.verifyAndSettle({ ...params, executionMetrics: undefined }), TypeError);
+    assert.throws(() => ledger.verifyAndSettle({ ...params, executionMetrics: 'not-an-object' }), TypeError);
+
+    // 2. Negative or non-numeric complexityFactor
+    assert.throws(
+      () => ledger.verifyAndSettle({ ...params, executionMetrics: { executionTimeMs: 10, inputSize: 2, complexityFactor: -1 } }),
+      RangeError
+    );
+    assert.throws(
+      () => ledger.verifyAndSettle({ ...params, executionMetrics: { executionTimeMs: 10, inputSize: 2, complexityFactor: 0 } }),
+      RangeError
+    );
+    assert.throws(
+      () => ledger.verifyAndSettle({ ...params, executionMetrics: { executionTimeMs: 10, inputSize: 2, complexityFactor: NaN } }),
+      RangeError
+    );
+
+    // 3. Prototype pollution in resultData does not pollute ledger prototypes
+    const pollutionResult = JSON.parse('{"__proto__":{"polluted":true},"value":42}');
+    const cleanProof = worker.signProofOfCompute(shard.shardId, pollutionResult);
+    const pollClaim = {
+      ...params,
+      resultData: pollutionResult,
+      proofOfCompute: cleanProof,
+      attestationNonce: 'pollute-nonce'
+    };
+    const pollRes = ledger.verifyAndSettle(pollClaim);
+    assert.strictEqual(pollRes.settled, true);
+    assert.strictEqual(Object.prototype.polluted, undefined, 'Object.prototype must not be polluted');
+    assert.strictEqual({}.polluted, undefined);
+
+    // 4. Aborted status edge cases
+    const failRes = ledger.verifyAndSettle({ ...params, aborted: true, attestationNonce: 'aborted-nonce' });
+    assert.strictEqual(failRes.settled, false);
+    assert.strictEqual(failRes.cost, 0);
+
+    // 5. throwOnError: false returns cleanly on signature failure
+    const badSigNonThrow = ledger.verifyAndSettle({
+      ...params,
+      proofOfCompute: 'f'.repeat(64),
+      throwOnError: false
+    });
+    assert.strictEqual(badSigNonThrow.settled, false);
+    assert.strictEqual(badSigNonThrow.cost, 0);
+    assert.ok(typeof badSigNonThrow.error === 'string');
+
+    assert.strictEqual(ledger.getBalance(requester.nodeId) < 200, true);
+    assert.strictEqual(ledger.verifyAuditLog().valid, true);
+  });
 });
 
 // ============================================================================
@@ -933,6 +1059,68 @@ describe('Milestone 6 (F31): Fail-Closed Balance Enforcement, Conservation & Aud
     const checkChain = tamperedLedgerChain.verifyAuditLog();
     assert.strictEqual(checkChain.valid, false);
     assert.match(checkChain.error, /prevHash chain broken/i);
+  });
+
+  test('F31.05: Chain split simulation — detects divergent audit forks from common ancestor and isolates branched histories', () => {
+    // 1. Establish common ancestor state
+    const baseLedger = new ProofOfComputeLedger();
+    const requester = new MeshCryptoEngine();
+    const workerA = new MeshCryptoEngine();
+    const workerB = new MeshCryptoEngine();
+    baseLedger.createAccount(requester.nodeId, 500);
+
+    for (let i = 0; i < 3; i++) {
+      const claim = makeSignedShardClaim(workerA, requester.nodeId, `return data.map(n => n + ${i});`, [i, i + 1], {
+        executionTimeMs: 20,
+        attestationNonce: `ancestor-${i}`
+      });
+      assert.strictEqual(baseLedger.verifyAndSettle(claim.params).settled, true);
+    }
+
+    assert.strictEqual(baseLedger.auditLog.length, 3);
+    const commonAncestorHash = baseLedger.auditLog[2].hash;
+
+    // 2. Network partition occurs: fork into Branch A and Branch B
+    const forkA = ProofOfComputeLedger.fromState(baseLedger.exportState());
+    const forkB = ProofOfComputeLedger.fromState(baseLedger.exportState());
+
+    // Branch A settles Shard 4A with Worker A
+    const claimA = makeSignedShardClaim(workerA, requester.nodeId, 'return data.map(n => n * 2);', [10, 20], {
+      executionTimeMs: 25,
+      attestationNonce: 'fork-A-nonce'
+    });
+    const resA = forkA.verifyAndSettle(claimA.params);
+    assert.strictEqual(resA.settled, true);
+
+    // Branch B settles Shard 4B with Worker B
+    const claimB = makeSignedShardClaim(workerB, requester.nodeId, 'return data.map(n => n * 3);', [30, 40], {
+      executionTimeMs: 30,
+      attestationNonce: 'fork-B-nonce'
+    });
+    const resB = forkB.verifyAndSettle(claimB.params);
+    assert.strictEqual(resB.settled, true);
+
+    // 3. Chain split verification:
+    // Both branches advanced to index 3 with the exact same prevHash (the common ancestor)
+    assert.strictEqual(forkA.auditLog[3].prevHash, commonAncestorHash);
+    assert.strictEqual(forkB.auditLog[3].prevHash, commonAncestorHash);
+
+    // The block digests diverged deterministically
+    assert.notStrictEqual(forkA.auditLog[3].hash, forkB.auditLog[3].hash);
+    assert.notStrictEqual(forkA.getBalance(requester.nodeId), forkB.getBalance(requester.nodeId));
+
+    // Both chains are internally valid
+    assert.deepStrictEqual(forkA.verifyAuditLog(), { valid: true, length: 4 });
+    assert.deepStrictEqual(forkB.verifyAuditLog(), { valid: true, length: 4 });
+
+    // 4. Cross-branch collision prevention:
+    // Attempting to append Branch B's divergent entry onto Fork A breaks the hash chain
+    const corruptedChain = JSON.parse(JSON.stringify(forkA.exportState()));
+    corruptedChain.auditLog.push({ ...forkB.auditLog[3], index: 4, prevHash: forkA.auditLog[3].hash });
+    const badLedger = ProofOfComputeLedger.fromState(corruptedChain);
+    const verifyRes = badLedger.verifyAuditLog();
+    assert.strictEqual(verifyRes.valid, false);
+    assert.match(verifyRes.error, /digest mismatch/i);
   });
 });
 

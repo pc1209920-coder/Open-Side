@@ -3,8 +3,63 @@ const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
 const { URL } = require('node:url');
+const { isUtf8 } = require('node:buffer');
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+/**
+ * Validates whether a buffer represents valid UTF-8 data according to RFC 3629.
+ * @param {Buffer} buf
+ * @returns {boolean}
+ */
+function isValidUTF8(buf) {
+  if (typeof isUtf8 === 'function') {
+    return isUtf8(buf);
+  }
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(buf);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Truncates a UTF-8 buffer to maxBytes without cutting a multibyte sequence in half.
+ * @param {Buffer} buf
+ * @param {number} [maxBytes] default 123
+ * @returns {Buffer}
+ */
+function truncateUtf8(buf, maxBytes = 123) {
+  if (buf.length <= maxBytes) return buf;
+  let end = maxBytes;
+  while (end > 0 && (buf[end] & 0xC0) === 0x80) {
+    end--;
+  }
+  if (end > 0 && (buf[end] & 0x80) !== 0) {
+    const b = buf[end];
+    let seqLen = 1;
+    if ((b & 0xE0) === 0xC0) seqLen = 2;
+    else if ((b & 0xF0) === 0xE0) seqLen = 3;
+    else if ((b & 0xF8) === 0xF0) seqLen = 4;
+    if (end + seqLen > maxBytes) {
+      return buf.subarray(0, end);
+    }
+  }
+  return buf.subarray(0, end);
+}
+
+/**
+ * Validates whether a close status code is valid to appear on the wire per RFC 6455 7.4.
+ * @param {number} code
+ * @returns {boolean}
+ */
+function isValidCloseCode(code) {
+  if (typeof code !== 'number' || !Number.isInteger(code)) return false;
+  if ((code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014)) return true;
+  if (code >= 3000 && code <= 4999) return true;
+  return false;
+}
 
 const OPCODES = {
   CONTINUATION: 0x0,
@@ -40,6 +95,16 @@ function encodeFrame(data, options = {}) {
   const opcode = options.opcode !== undefined ? options.opcode : defaultOpcode;
   const fin = options.fin !== undefined ? Boolean(options.fin) : true;
   const mask = Boolean(options.mask);
+  const isControl = (opcode & 0x08) !== 0;
+
+  if (isControl) {
+    if (!fin) {
+      throw new RangeError('WebSocket control frames cannot be fragmented (FIN must be true)');
+    }
+    if (payloadBuf.length > 125) {
+      throw new RangeError('WebSocket control frame payload cannot exceed 125 bytes');
+    }
+  }
 
   const payloadLength = payloadBuf.length;
   let headerLength = 2;
@@ -382,18 +447,42 @@ class WebSocketConnection extends EventEmitter {
 
     // Control frames (CLOSE, PING, PONG)
     if (frame.opcode === OPCODES.CLOSE) {
+      const alreadyClosing = this.readyState >= 2;
       this.readyState = 2; // CLOSING
-      let code = 1000;
+      let emitCode = 1005;
+      let replyCode = 1000;
       let reason = '';
+
       if (frame.payload && frame.payload.length >= 2) {
-        code = frame.payload.readUInt16BE(0);
-        reason = frame.payload.subarray(2).toString('utf8');
+        emitCode = frame.payload.readUInt16BE(0);
+        replyCode = emitCode;
+        if (!isValidCloseCode(emitCode)) {
+          const err = new Error(`Invalid WebSocket close status code: ${emitCode}`);
+          err.code = 1002;
+          this._fail(err);
+          this.close(1002, 'Protocol Error: invalid close code');
+          return;
+        }
+        if (frame.payload.length > 2) {
+          const reasonBuf = frame.payload.subarray(2);
+          if (!isValidUTF8(reasonBuf)) {
+            const err = new Error('Invalid UTF-8 in close reason payload');
+            err.code = 1007;
+            this._fail(err);
+            this.close(1007, 'Protocol Error: invalid UTF-8 in close reason');
+            return;
+          }
+          reason = reasonBuf.toString('utf8');
+        }
       }
-      this._sendCloseFrame(code, reason);
+
+      if (!alreadyClosing) {
+        this._sendCloseFrame(replyCode, reason);
+      }
       this.readyState = 3; // CLOSED
       this.closed = true;
       this.socket.end();
-      this.emit('close', code, reason);
+      this.emit('close', emitCode, reason);
       return;
     }
 

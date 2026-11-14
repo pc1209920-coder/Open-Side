@@ -11,7 +11,8 @@ const {
   compareDistance,
   normalizeNodeId,
   getBucketIndex,
-  ID_BYTES
+  ID_BYTES,
+  ID_BITS
 } = require('../src/dht');
 
 test('XOR Distance Metric - calculates bitwise XOR distance and symmetry', () => {
@@ -214,4 +215,231 @@ test('KademliaDHT - Iterative Distributed Network Simulation (Bootstrap, Multi-h
   const lookupRes = await nodes[4].lookupValue(targetKey);
   assert.strictEqual(lookupRes.found, true);
   assert.deepStrictEqual(lookupRes.value, testPayload);
+});
+
+test('RoutingTable Stress - High churn, capacity bounds, and XOR monotonic ordering under load', () => {
+  const localId = crypto.randomBytes(ID_BYTES);
+  const kVal = 5;
+  const rt = new RoutingTable(localId, { k: kVal });
+
+  // 1. High-volume insertion: insert 500 contacts
+  for (let i = 0; i < 500; i++) {
+    rt.addContact({ id: crypto.randomBytes(ID_BYTES), address: '127.0.0.1', port: 1000 + i });
+  }
+
+  // 2. Capacity bounds verification
+  assert.ok(rt.size <= ID_BITS * kVal, 'Routing table total size must never exceed 160 * k');
+  let totalInBuckets = 0;
+  for (const bucket of rt.buckets) {
+    assert.ok(bucket.length <= kVal, `KBucket must not exceed k=${kVal}`);
+    totalInBuckets += bucket.length;
+  }
+  assert.strictEqual(rt.size, totalInBuckets, 'rt.size must match sum of bucket lengths');
+
+  // 3. Monotonic XOR distance ordering under load
+  for (let q = 0; q < 20; q++) {
+    const target = crypto.randomBytes(ID_BYTES);
+    const closest = rt.findClosestNodes(target, 10);
+    const targetBuf = normalizeNodeId(target);
+    for (let i = 0; i < closest.length - 1; i++) {
+      const d1 = xorDistance(closest[i].idBuffer, targetBuf);
+      const d2 = xorDistance(closest[i + 1].idBuffer, targetBuf);
+      assert.ok(compareDistance(d1, d2) <= 0, 'findClosestNodes must maintain non-decreasing XOR distance order');
+    }
+  }
+
+  // 4. High churn stress: add, delete, and re-add contacts
+  const churnContacts = [];
+  for (let i = 0; i < 100; i++) {
+    const c = { id: crypto.randomBytes(ID_BYTES), address: '127.0.0.1', port: 5000 + i };
+    churnContacts.push(c);
+    rt.addContact(c);
+  }
+  const sizeBeforeRemoval = rt.size;
+  let removedCount = 0;
+  for (let i = 0; i < 50; i++) {
+    if (rt.removeContact(churnContacts[i].id)) {
+      removedCount++;
+    }
+  }
+  assert.ok(rt.size <= sizeBeforeRemoval, 'rt.size must not increase upon contact removals');
+  let currentTotal = 0;
+  for (const bucket of rt.buckets) currentTotal += bucket.length;
+  assert.strictEqual(rt.size, currentTotal, 'rt.size must match sum of bucket lengths');
+  for (let i = 0; i < 50; i++) {
+    const targetBuf = normalizeNodeId(churnContacts[i].id);
+    const inTable = rt.getAllContacts().some((c) => c.idBuffer.equals(targetBuf));
+    assert.strictEqual(inTable, false, 'Removed contact must not appear in table');
+  }
+});
+
+test('RoutingTable Bucket Partitioning & Boundary Logic - Full 160-bit prefix coverage and overflow', () => {
+  const baseId = Buffer.alloc(ID_BYTES, 0x00);
+  const rt = new RoutingTable(baseId, { k: 2 });
+
+  // 1. Verify coverage across all 160 bucket positions (bit 0 through 159)
+  for (let bit = 0; bit < ID_BITS; bit++) {
+    const peerId = Buffer.alloc(ID_BYTES, 0x00);
+    const byteIdx = Math.floor(bit / 8);
+    const bitInByte = bit % 8;
+    peerId[byteIdx] = 1 << (7 - bitInByte);
+
+    const calculatedIdx = getBucketIndex(baseId, peerId);
+    assert.strictEqual(calculatedIdx, bit, `Bit ${bit} must map to bucket index ${bit}`);
+
+    const res = rt.addContact({ id: peerId, address: '127.0.0.1', port: 8000 + bit });
+    assert.strictEqual(res.status, 'ADDED', `Adding peer differing at bit ${bit} should succeed`);
+    assert.strictEqual(rt.buckets[bit].length, 1, `Bucket ${bit} should have length 1`);
+  }
+  assert.strictEqual(rt.size, 160, 'Table should have 160 contacts across all buckets');
+
+  // 2. Boundary conditions: Bit 0 (MSB) and Bit 159 (LSB)
+  const msbDiff = Buffer.alloc(ID_BYTES, 0x00);
+  msbDiff[0] = 0x80;
+  assert.strictEqual(getBucketIndex(baseId, msbDiff), 0, 'MSB differing must be bucket 0');
+
+  const lsbDiff = Buffer.alloc(ID_BYTES, 0x00);
+  lsbDiff[ID_BYTES - 1] = 0x01;
+  assert.strictEqual(getBucketIndex(baseId, lsbDiff), 159, 'LSB differing must be bucket 159');
+
+  // 3. Bucket overflow & replacement policy verification
+  const overflowRt = new RoutingTable(baseId, { k: 2 });
+  const c1 = { id: Buffer.from('80' + '00'.repeat(19), 'hex'), address: '127.0.0.1', port: 9001 };
+  const c2 = { id: Buffer.from('81' + '00'.repeat(19), 'hex'), address: '127.0.0.1', port: 9002 };
+  const c3 = { id: Buffer.from('82' + '00'.repeat(19), 'hex'), address: '127.0.0.1', port: 9003 };
+
+  assert.strictEqual(overflowRt.addContact(c1).status, 'ADDED');
+  assert.strictEqual(overflowRt.addContact(c2).status, 'ADDED');
+  assert.strictEqual(overflowRt.buckets[0].length, 2);
+
+  // Third contact targeting full bucket returns FULL and identifies staleContact
+  const fullRes = overflowRt.addContact(c3);
+  assert.strictEqual(fullRes.status, 'FULL');
+  assert.strictEqual(fullRes.staleContact.id, c1.id.toString('hex'));
+  assert.strictEqual(overflowRt.buckets[0].length, 2);
+
+  // Evict stale contact and verify candidate in replacementCache is automatically promoted
+  assert.strictEqual(overflowRt.removeContact(c1.id), true);
+  assert.strictEqual(overflowRt.buckets[0].length, 2);
+  assert.strictEqual(overflowRt.buckets[0].contacts[1].id, c3.id.toString('hex'), 'Candidate c3 should be promoted from replacementCache');
+  // Re-adding c3 updates its timestamp as it is already present
+  assert.strictEqual(overflowRt.addContact(c3).status, 'UPDATED');
+
+  // 4. Self-node ignore invariant
+  const selfRes = overflowRt.addContact({ id: baseId, address: '127.0.0.1', port: 9099 });
+  assert.strictEqual(selfRes.status, 'SELF_IGNORED');
+});
+
+test('KademliaDHT - Concurrent Incoming RPC Stress and Race Handling', async () => {
+  const dht = new KademliaDHT(crypto.randomBytes(ID_BYTES));
+
+  // 1. Fire 100 concurrent incoming RPC requests across all supported methods
+  const rpcPromises = [];
+  for (let i = 0; i < 100; i++) {
+    const sender = { id: crypto.randomBytes(ID_BYTES), address: '127.0.0.1', port: 7000 + i };
+    const rpcType = ['PING', 'STORE', 'FIND_NODE', 'FIND_VALUE'][i % 4];
+    rpcPromises.push(Promise.resolve().then(() => {
+      return dht.handleRpc(rpcType, sender, {
+        key: `concurrent:store:key:${i % 10}`,
+        value: { idx: i, payload: `test-data-${i}` },
+        targetId: sender.id
+      });
+    }));
+  }
+
+  const responses = await Promise.all(rpcPromises);
+  assert.strictEqual(responses.length, 100, 'All 100 concurrent RPCs must settle');
+  for (const resp of responses) {
+    assert.ok(resp && resp.type, 'Each RPC response must have a valid type');
+  }
+
+  // 2. Simultaneous STORE and FIND_VALUE race conditions on the same key
+  const raceKey = 'concurrent:race:key:shared';
+  const racePromises = [];
+  for (let i = 0; i < 20; i++) {
+    const sender = { id: crypto.randomBytes(ID_BYTES), address: '127.0.0.1', port: 8500 + i };
+    racePromises.push(Promise.resolve().then(() => {
+      dht.handleRpc('STORE', sender, { key: raceKey, value: { updateId: i } });
+    }));
+    racePromises.push(Promise.resolve().then(() => {
+      return dht.handleRpc('FIND_VALUE', sender, { key: raceKey });
+    }));
+  }
+
+  const raceResults = await Promise.all(racePromises);
+  assert.strictEqual(raceResults.length, 40, 'All concurrent race operations must complete');
+  const finalVal = dht.getLocal(raceKey);
+  assert.ok(finalVal && typeof finalVal.updateId === 'number', 'Key must hold valid final update');
+});
+
+test('KademliaDHT - Multi-node Network Concurrency with Latency Jitter and Peer Failures', async () => {
+  const nodeCount = 5;
+  const nodes = [];
+  const nodeMap = new Map();
+
+  for (let i = 0; i < nodeCount; i++) {
+    const id = Buffer.alloc(ID_BYTES, i + 1);
+    const dht = new KademliaDHT(id, { k: 4, alpha: 2 });
+    nodes.push(dht);
+    nodeMap.set(dht.localId, dht);
+  }
+
+  // Define one peer that fails intermittently/unreachable
+  const failingPeerId = nodes[3].localId;
+
+  for (const node of nodes) {
+    node.setRpcHandler(async (targetContact, rpcType, payload) => {
+      // Simulate network latency jitter (1-5ms)
+      await new Promise((r) => setTimeout(r, Math.floor(Math.random() * 5) + 1));
+
+      if (targetContact.id === failingPeerId) {
+        throw new Error('RPC connection refused: peer crashed');
+      }
+
+      const targetNode = nodeMap.get(targetContact.id);
+      if (!targetNode) throw new Error(`Node ${targetContact.id} unreachable`);
+      return targetNode.handleRpc(rpcType, { id: node.localId, address: '127.0.0.1' }, payload);
+    });
+  }
+
+  // Bootstrap reachable nodes together
+  await nodes[1].bootstrap([{ id: nodes[0].localId, address: '127.0.0.1' }]);
+  await nodes[2].bootstrap([{ id: nodes[1].localId, address: '127.0.0.1' }]);
+  // Also add failing node 3 to routing tables so peers encounter it during concurrent lookups
+  nodes[0].routingTable.addContact({ id: nodes[3].localId, address: '127.0.0.1' });
+  nodes[1].routingTable.addContact({ id: nodes[3].localId, address: '127.0.0.1' });
+  nodes[2].routingTable.addContact({ id: nodes[3].localId, address: '127.0.0.1' });
+  // Node 4 bootstraps to reachable node 2
+  await nodes[4].bootstrap([{ id: nodes[2].localId, address: '127.0.0.1' }]);
+
+  // Concurrently store multiple values from multiple origins
+  const storeOps = [];
+  for (let i = 0; i < 5; i++) {
+    storeOps.push(nodes[0].storeValue(`dataset:partition:${i}`, { partition: i, ready: true }));
+    storeOps.push(nodes[1].storeValue(`model:weights:${i}`, { layer: i, converged: true }));
+  }
+  await Promise.all(storeOps);
+
+  // Concurrently perform iterative lookups across healthy nodes
+  const lookupOps = [];
+  for (let i = 0; i < 5; i++) {
+    lookupOps.push(nodes[2].lookupValue(`dataset:partition:${i}`));
+    lookupOps.push(nodes[4].lookupValue(`model:weights:${i}`));
+  }
+  const lookupResults = await Promise.all(lookupOps);
+
+  for (let i = 0; i < 5; i++) {
+    const datasetRes = lookupResults[i * 2];
+    const modelRes = lookupResults[i * 2 + 1];
+    assert.strictEqual(datasetRes.found, true);
+    assert.deepStrictEqual(datasetRes.value, { partition: i, ready: true });
+    assert.strictEqual(modelRes.found, true);
+    assert.deepStrictEqual(modelRes.value, { layer: i, converged: true });
+  }
+
+  for (const node of nodes) {
+    if (typeof node.destroy === 'function') {
+      node.destroy();
+    }
+  }
 });

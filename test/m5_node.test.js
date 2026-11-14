@@ -3,13 +3,16 @@ const assert = require('node:assert/strict');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
+const v8 = require('node:v8');
 
 const {
   P2PNode,
   FrameTooLargeError,
   SocketDestroyedError,
   AlreadyListeningError,
-  HandshakeTimeoutError
+  HandshakeTimeoutError,
+  SecurityError,
+  STREAM_FRAME_TAG
 } = require('../src/node');
 const { MeshCryptoEngine } = require('../src/crypto');
 const { GridRouter } = require('../src/router');
@@ -612,6 +615,92 @@ describe('Milestone 5 (F24 & F25): Native P2P TCP Daemon, Ephemeral Loopback & I
       'burst'
     );
   });
+
+  test('Peer Churn & Flapping: Rapid connect -> disconnect -> reconnect cycles preserve replay state, event balance, and duplicate socket tie-break', async () => {
+    async function runChurn(useIpc) {
+      const server = new P2PNode();
+      const clientCrypto = new MeshCryptoEngine();
+      let serverEp;
+      try {
+        serverEp = await listenWithFallback(server, useIpc, 'churn-srv');
+      } catch (err) {
+        await server.close();
+        throw err;
+      }
+
+      const connectedEvents = [];
+      const disconnectedEvents = [];
+      server.on('peerConnected', (ev) => connectedEvents.push(ev));
+      server.on('peerDisconnected', (ev) => disconnectedEvents.push(ev));
+
+      try {
+        // First connection
+        let client = new P2PNode({ crypto: clientCrypto });
+        let sock = await client.connect(serverEp);
+        let sessionKey = await client.initiateHandshake(sock, server.crypto.publicKey);
+        assert.strictEqual(sessionKey.length, 32);
+        assert.strictEqual(server.peers.size, 1);
+        assert.strictEqual(connectedEvents.length, 1);
+
+        let msg1P = waitForEvent(server, 'message');
+        await client.sendEncryptedMessage(server.nodeId, 'PING_FLAP_1', { step: 1 });
+        const msg1 = await msg1P;
+        assert.strictEqual(msg1.type, 'PING_FLAP_1');
+
+        // Abrupt disconnect
+        sock.destroy();
+        await waitForCondition(() => server.peers.size === 0, 2000);
+        assert.strictEqual(disconnectedEvents.length, 1);
+        assert.strictEqual(disconnectedEvents[0].peerId, client.nodeId);
+        await client.close();
+
+        // Flap reconnect: fresh P2PNode with the EXACT same clientCrypto (same nodeId & key)
+        const client2 = new P2PNode({ crypto: clientCrypto });
+        try {
+          const sock2 = await client2.connect(serverEp);
+          const sessionKey2 = await client2.initiateHandshake(sock2, server.crypto.publicKey);
+          assert.strictEqual(sessionKey2.length, 32);
+          assert.strictEqual(server.peers.size, 1);
+          assert.strictEqual(connectedEvents.length, 2);
+
+          // Sequence number restarts from 1 on new socket; server must accept without replay error
+          const msg2P = waitForEvent(server, 'message');
+          await client2.sendEncryptedMessage(server.nodeId, 'PING_FLAP_2', { step: 2 });
+          const msg2 = await msg2P;
+          assert.strictEqual(msg2.type, 'PING_FLAP_2');
+
+          // Clean close
+          await client2.close();
+          await waitForCondition(() => server.peers.size === 0, 2000);
+          assert.strictEqual(disconnectedEvents.length, 2);
+        } finally {
+          await client2.close();
+        }
+
+        // 2. Rapid churn loop (4 iterations): verify event balance and zero leaked sockets
+        for (let i = 0; i < 4; i++) {
+          const churnClient = new P2PNode();
+          const churnSock = await churnClient.connect(serverEp);
+          await churnClient.initiateHandshake(churnSock, server.crypto.publicKey);
+          churnSock.destroy();
+          await churnClient.close();
+        }
+        await waitForCondition(() => server.peers.size === 0, 2000);
+        assert.strictEqual(connectedEvents.length, 6);
+        assert.strictEqual(disconnectedEvents.length, 6);
+        assert.strictEqual(server._sockets.size, 0);
+      } finally {
+        await server.close();
+      }
+    }
+
+    try {
+      await runChurn(false);
+    } catch (err) {
+      if (!isTcpRestrictedError(err)) throw err;
+      await runChurn(true);
+    }
+  });
 });
 
 // ============================================================================
@@ -847,6 +936,133 @@ describe('Milestone 5 (F26): Length-Prefixed Wire Framing Resilience', () => {
         }
       },
       'badjson'
+    );
+  });
+
+  test('Binary Wire Framing: node:v8 serialization, malformed v8 payload fail-closed, and non-object array rejection', async () => {
+    // 1. Static encode / decode with format = 'v8'
+    const obj = { kind: 'DATA', num: 12345, buf: Buffer.from('v8-test') };
+    const encodedV8 = P2PNode.encodeFrame(obj, 4096, 'v8');
+    const len = encodedV8.readUInt32BE(0);
+    assert.strictEqual(len, encodedV8.length - 4);
+    assert.strictEqual(encodedV8[4], 0x02); // 0x02 format tag
+    const decodedV8 = P2PNode.decodeWireBody(encodedV8.subarray(4));
+    assert.strictEqual(decodedV8.isStream, false);
+    assert.strictEqual(decodedV8.data.kind, 'DATA');
+    assert.strictEqual(decodedV8.data.num, 12345);
+    assert.deepStrictEqual(decodedV8.data.buf, Buffer.from('v8-test'));
+
+    // 2. Live connected pair using useV8Serialization: true
+    const { client, server } = await createConnectedPair(
+      () => ({ useV8Serialization: true }),
+      () => ({ useV8Serialization: true })
+    );
+
+    try {
+      const pMsg = waitForEvent(server, 'message');
+      await client.sendEncryptedMessage(server.nodeId, 'V8_TEST', { test: 'binary-v8-payload', count: 99 });
+      const received = await pMsg;
+      assert.strictEqual(received.type, 'V8_TEST');
+      assert.deepStrictEqual(received.payload, { test: 'binary-v8-payload', count: 99 });
+    } finally {
+      await Promise.allSettled([client.close(), server.close()]);
+    }
+
+    // 3. Raw socket sends corrupted v8 frame (0x02 followed by garbage) -> ERR_INVALID_WIRE_JSON
+    await runWithServerFallback(
+      () => new P2PNode(),
+      async (serverNode, ep) => {
+        const wireErrors = [];
+        serverNode.on('wireError', (err) => wireErrors.push(err));
+        const sock = await connectRawSocket(ep);
+        try {
+          const closeP = waitForEvent(sock, 'close', 2000);
+          const garbage = Buffer.from([0x02, 0xff, 0xff, 0xff, 0xff, 0x00, 0x12]);
+          const hdr = Buffer.alloc(4);
+          hdr.writeUInt32BE(garbage.length, 0);
+          sock.write(Buffer.concat([hdr, garbage]));
+          await closeP;
+          assert.strictEqual(sock.destroyed, true);
+          assert.ok(wireErrors.some((e) => e.code === 'ERR_INVALID_WIRE_JSON'));
+        } finally {
+          if (!sock.destroyed) sock.destroy();
+        }
+      },
+      'v8-corrupt'
+    );
+  });
+
+  test('Binary Framing Security & Boundaries: unauthenticated stream frame rejection, coalesced 0-length keepalives, and exact maxFrameSize', async () => {
+    // 1. Unauthenticated stream frame (STREAM_FRAME_TAG = 0x03) before handshake fails closed with SecurityError
+    await runWithServerFallback(
+      () => new P2PNode(),
+      async (serverNode, ep) => {
+        const wireErrors = [];
+        serverNode.on('wireError', (err) => wireErrors.push(err));
+        const sock = await connectRawSocket(ep);
+        try {
+          const closeP = waitForEvent(sock, 'close', 2000);
+          const streamFrame = P2PNode.encodeStreamFrame(1, Buffer.from('unauth-stream-data'));
+          sock.write(streamFrame);
+          await closeP;
+          assert.strictEqual(sock.destroyed, true);
+          assert.ok(wireErrors.some((e) => e instanceof SecurityError && e.code === 'ERR_UNAUTHENTICATED_STREAM_FRAME'));
+        } finally {
+          if (!sock.destroyed) sock.destroy();
+        }
+      },
+      'stream-unauth'
+    );
+
+    // 2. Coalesced zero-length keepalives directly preceding valid handshake in single write chunk
+    await runWithServerFallback(
+      () => new P2PNode(),
+      async (serverNode, ep) => {
+        const client = new P2PNode();
+        try {
+          const clientSock = await client.connect(ep);
+          const keepalives = Buffer.concat([
+            Buffer.from([0x00, 0x00, 0x00, 0x00]),
+            Buffer.from([0x00, 0x00, 0x00, 0x00]),
+            Buffer.from([0x00, 0x00, 0x00, 0x00])
+          ]);
+          clientSock.write(keepalives);
+          const key = await client.initiateHandshake(clientSock, serverNode.crypto.publicKey);
+          assert.strictEqual(key.length, 32);
+          assert.strictEqual(serverNode.peers.size, 1);
+        } finally {
+          await client.close();
+        }
+      },
+      'coalesced-keepalives'
+    );
+
+    // 3. Exact maxFrameSize boundary condition (payload length === maxFrameSize succeeds, maxFrameSize + 1 throws)
+    const exactPayload = { text: 'a'.repeat(90) };
+    const sampleFrame = P2PNode.encodeFrame(exactPayload);
+    const exactBodyLen = sampleFrame.length - 4;
+    const okFrame = P2PNode.encodeFrame(exactPayload, exactBodyLen);
+    assert.strictEqual(okFrame.readUInt32BE(0), exactBodyLen);
+    assert.throws(
+      () => P2PNode.encodeFrame(exactPayload, exactBodyLen - 1),
+      (err) => err instanceof FrameTooLargeError
+    );
+
+    // 4. 4GB unsigned length header 0xFFFFFFFF fails closed without OOM
+    await runWithServerFallback(
+      () => new P2PNode(),
+      async (serverNode, ep) => {
+        const sock = await connectRawSocket(ep);
+        try {
+          const closeP = waitForEvent(sock, 'close', 2000);
+          sock.write(Buffer.from([0xff, 0xff, 0xff, 0xff, 0x01]));
+          await closeP;
+          assert.strictEqual(sock.destroyed, true);
+        } finally {
+          if (!sock.destroyed) sock.destroy();
+        }
+      },
+      'header-4gb'
     );
   });
 });
@@ -1640,6 +1856,92 @@ describe('Milestone 5 (F28): Encrypted Shard Streaming, PoC Delivery, Anti-Repla
       } finally {
         if (hangTimer) clearTimeout(hangTimer);
         await Promise.allSettled([client.close(), server.close()]);
+      }
+    }
+  });
+
+  test('Socket Disconnection Resilience: mid-handshake abort, in-flight key rotation disconnect, and concurrent multi-shard abrupt destruction', async () => {
+    // 1. Mid-handshake abort: client destroys socket while handshake is in-flight
+    {
+      const { client, server, socket } = await createConnectedPair(
+        () => ({}),
+        () => ({}),
+        { handshake: false }
+      );
+      try {
+        const hsPromise = client.initiateHandshake(socket, server.crypto.publicKey);
+        socket.destroy();
+        await assert.rejects(
+          hsPromise,
+          (err) => err instanceof SocketDestroyedError && /Socket closed before handshake completed/i.test(err.message)
+        );
+      } finally {
+        await Promise.allSettled([client.close(), server.close()]);
+      }
+    }
+
+    // 2. In-flight key rotation disconnect: socket destroyed while waiting for KEY_ROTATE_ACK
+    {
+      const { client, server, proxy } = await createProxiedPair();
+      try {
+        proxy.setHooks({
+          onClientToServer(chunk, upstreamSock, clientSock) {
+            clientSock.destroy();
+            upstreamSock.destroy();
+          }
+        });
+
+        await assert.rejects(
+          () => client.rotateSessionKey(server.nodeId),
+          (err) => err instanceof SocketDestroyedError && /Peer disconnected during key rotation/i.test(err.message)
+        );
+        assert.strictEqual(client.peers.size, 0);
+      } finally {
+        await Promise.allSettled([client.close(), server.close(), proxy.close()]);
+      }
+    }
+
+    // 3. Concurrent multi-shard dispatch on abrupt socket destruction: all pending shards reject cleanly
+    {
+      let hangTimer = null;
+      const delayedSandbox = {
+        executeIsolatedShardAsync(shard) {
+          return new Promise((resolve) => {
+            hangTimer = setTimeout(() => resolve({ shardId: shard.shardId, output: 1 }), 500);
+            if (typeof hangTimer.unref === 'function') hangTimer.unref();
+          });
+        },
+        executeIsolatedShard(shard) {
+          return { shardId: shard.shardId, output: 1 };
+        }
+      };
+
+      const { client: coordinator, server: worker } = await createConnectedPair(
+        () => ({}),
+        () => ({ sandbox: delayedSandbox, enforceTelemetry: false })
+      );
+
+      try {
+        const router = new GridRouter(coordinator.nodeId);
+        const shards = router.createTaskPartitions('return 1;', [1, 2, 3], 1);
+
+        const dispatches = shards.map((s) => coordinator.dispatchRemoteShard(worker.nodeId, s));
+        await delay(30);
+
+        // Abruptly destroy worker socket
+        worker.getPeer(coordinator.nodeId).socket.destroy();
+
+        const results = await Promise.allSettled(dispatches);
+        assert.strictEqual(results.length, 3);
+        for (const res of results) {
+          assert.strictEqual(res.status, 'rejected');
+          assert.ok(res.reason instanceof SocketDestroyedError);
+          assert.strictEqual(res.reason.code, 'ERR_PEER_DISCONNECTED');
+        }
+        assert.strictEqual(coordinator._pendingShards.size, 0);
+      } finally {
+        if (hangTimer) clearTimeout(hangTimer);
+        await Promise.allSettled([coordinator.close(), worker.close()]);
       }
     }
   });

@@ -32,6 +32,8 @@ class OpenSideDaemon extends EventEmitter {
     this.sea = null;
     this.gateway = null;
     this._exitHandler = null;
+    this._processExitHook = null;
+    this._crashTimestamps = [];
 
     // Configure cluster entry point to point directly to daemon.js
     if (this.isMaster) {
@@ -54,6 +56,11 @@ class OpenSideDaemon extends EventEmitter {
         fs.mkdirSync(logDir, { recursive: true });
       }
       this.logStream = fs.createWriteStream(this.logFile, { flags: 'a' });
+      this.logStream.on('error', (err) => {
+        if (!this.options.silent) {
+          console.error(`[LOG_STREAM_ERROR] ${err.message}`);
+        }
+      });
     }
   }
 
@@ -63,17 +70,29 @@ class OpenSideDaemon extends EventEmitter {
   log(level, message, meta = null) {
     const timestamp = new Date().toISOString();
     const prefix = `[${timestamp}] [${level.toUpperCase()}] [PID:${process.pid}]`;
-    const line = meta ? `${prefix} ${message} ${JSON.stringify(meta)}` : `${prefix} ${message}`;
+    let metaStr = '';
+    if (meta !== null && meta !== undefined) {
+      try {
+        metaStr = ' ' + JSON.stringify(meta);
+      } catch (err) {
+        metaStr = ` [SerializationError: ${err.message}]`;
+      }
+    }
+    const line = `${prefix} ${message}${metaStr}`;
 
-    if (this.logStream && !this.logStream.destroyed) {
-      this.logStream.write(line + '\n');
+    if (this.logStream && !this.logStream.destroyed && !this.logStream.writableEnded) {
+      try {
+        this.logStream.write(line + '\n');
+      } catch {}
     }
     if (!this.options.silent) {
       if (level === 'error') console.error(line);
       else if (level === 'warn') console.warn(line);
       else console.log(line);
     }
-    this.emit('log', { timestamp, level, message, meta });
+    try {
+      this.emit('log', { timestamp, level, message, meta });
+    } catch {}
   }
 
   /**
@@ -85,7 +104,45 @@ class OpenSideDaemon extends EventEmitter {
       if (!fs.existsSync(pidDir)) {
         fs.mkdirSync(pidDir, { recursive: true });
       }
-      fs.writeFileSync(this.pidFile, String(process.pid), 'utf8');
+
+      // Check if existing daemon is alive
+      if (fs.existsSync(this.pidFile)) {
+        try {
+          const stored = fs.readFileSync(this.pidFile, 'utf8').trim();
+          const existingPid = parseInt(stored, 10);
+          if (!isNaN(existingPid) && existingPid !== process.pid) {
+            let isAlive = false;
+            try {
+              process.kill(existingPid, 0);
+              isAlive = true;
+            } catch (kErr) {
+              if (kErr.code === 'EPERM') {
+                isAlive = true;
+              }
+            }
+            if (isAlive) {
+              throw new Error(`OpenSideDaemon already running with PID ${existingPid}`);
+            } else {
+              this.log('warn', `Removing stale PID file (${this.pidFile}) for dead PID ${existingPid}`);
+            }
+          }
+        } catch (readErr) {
+          if (readErr.message && readErr.message.includes('already running')) {
+            throw readErr;
+          }
+        }
+      }
+
+      // Write atomically via temporary file and rename
+      const tempPidFile = `${this.pidFile}.${process.pid}.${Date.now()}.tmp`;
+      fs.writeFileSync(tempPidFile, String(process.pid), 'utf8');
+      try {
+        fs.renameSync(tempPidFile, this.pidFile);
+      } catch {
+        fs.writeFileSync(this.pidFile, String(process.pid), 'utf8');
+        try { fs.unlinkSync(tempPidFile); } catch {}
+      }
+
       this.log('info', `PID ${process.pid} written to ${this.pidFile}`);
     } catch (err) {
       this.log('error', `Failed to write PID file: ${err.message}`);
@@ -114,6 +171,9 @@ class OpenSideDaemon extends EventEmitter {
    * Starts the daemon in master or worker cluster mode.
    */
   async start() {
+    if (this.running) {
+      return this;
+    }
     this._setupLogging();
 
     if (this.isMaster) {
@@ -131,6 +191,12 @@ class OpenSideDaemon extends EventEmitter {
     this.writePid();
     this.log('info', `Starting OpenSideDaemon Master across ${this.numWorkers} CPU core workers...`);
 
+    // Ensure PID file is removed on unexpected process exit
+    this._processExitHook = () => {
+      this.removePid();
+    };
+    process.on('exit', this._processExitHook);
+
     // Setup OS signal listeners for graceful shutdown
     this._bindSignals();
 
@@ -139,19 +205,25 @@ class OpenSideDaemon extends EventEmitter {
       this._forkWorker();
     }
 
-    // Initialize coordinator ComputeSea & HTTP Gateway if enabled
-    if (this.options.enableGateway) {
-      this.sea = new ComputeSea({
-        coordinatorId: `daemon-coord-${process.pid}`,
-        enforceEscrow: true
-      });
-      this.gateway = new OpenSideGateway({
-        sea: this.sea,
-        port: this.options.gatewayPort || 8080,
-        enableCluster: true
-      });
-      await this.gateway.listen();
-      this.log('info', `Daemon Gateway listening on port ${this.gateway.port}`);
+    try {
+      // Initialize coordinator ComputeSea & HTTP Gateway if enabled
+      if (this.options.enableGateway) {
+        this.sea = new ComputeSea({
+          coordinatorId: `daemon-coord-${process.pid}`,
+          enforceEscrow: true
+        });
+        this.gateway = new OpenSideGateway({
+          sea: this.sea,
+          port: this.options.gatewayPort || 8080,
+          enableCluster: true
+        });
+        await this.gateway.listen();
+        this.log('info', `Daemon Gateway listening on port ${this.gateway.port}`);
+      }
+    } catch (err) {
+      this.log('error', `Failed to initialize daemon gateway: ${err.message}`);
+      await this.stop('STARTUP_ERROR');
+      throw err;
     }
 
     this.emit('started', { mode: 'master', pid: process.pid, workers: this.workers.size });
@@ -181,6 +253,10 @@ class OpenSideDaemon extends EventEmitter {
     this.workers.set(worker.id, workerState);
     this.log('info', `Spawned cluster worker #${worker.id} (PID:${workerState.pid})`);
 
+    worker.on('error', (err) => {
+      this.log('error', `Worker #${worker.id} process error: ${err.message}`);
+    });
+
     worker.on('message', (msg) => {
       this._handleWorkerMessage(worker.id, msg);
     });
@@ -192,9 +268,18 @@ class OpenSideDaemon extends EventEmitter {
         // Re-queue or fail in-flight task
         const pending = this.pendingTasks.get(state.activeTaskId);
         if (pending) {
-          this.log('warn', `Re-queueing interrupted task ${state.activeTaskId} from dead worker #${worker.id}`);
-          this.taskQueue.unshift(pending.task);
-          this.pendingTasks.delete(state.activeTaskId);
+          const retries = (pending.task.retries || 0) + 1;
+          pending.task.retries = retries;
+          const maxRetries = this.options.maxTaskRetries !== undefined ? this.options.maxTaskRetries : 2;
+          if (retries <= maxRetries) {
+            this.log('warn', `Re-queueing interrupted task ${state.activeTaskId} from dead worker #${worker.id} (attempt ${retries}/${maxRetries})`);
+            this.taskQueue.unshift(pending.task);
+          } else {
+            this.log('error', `Task ${state.activeTaskId} exceeded max retries (${maxRetries}) after worker #${worker.id} died`);
+            clearTimeout(pending.timeoutTimer);
+            this.pendingTasks.delete(state.activeTaskId);
+            pending.reject(new Error(`Task ${state.activeTaskId} aborted: worker died repeatedly (${retries} attempts)`));
+          }
         }
       }
       this.workers.delete(worker.id);
@@ -202,9 +287,19 @@ class OpenSideDaemon extends EventEmitter {
 
       // Auto-restart replacement worker if daemon is still running
       if (this.running && !this.stopping) {
-        this.log('info', `Self-healing: restarting replacement worker for #${worker.id}...`);
-        this._forkWorker();
-        this._drainQueue();
+        const now = Date.now();
+        this._crashTimestamps = (this._crashTimestamps || []).filter(t => now - t < 10000);
+        this._crashTimestamps.push(now);
+        const maxCrashesInWindow = Math.max(10, this.numWorkers * 3);
+
+        if (this._crashTimestamps.length > maxCrashesInWindow) {
+          this.log('error', `Worker crash storm detected (${this._crashTimestamps.length} crashes in 10s). Suspending auto-restart to prevent resource exhaustion.`);
+          this.emit('crashStorm', { crashes: this._crashTimestamps.length });
+        } else {
+          this.log('info', `Self-healing: restarting replacement worker for #${worker.id}...`);
+          this._forkWorker();
+          this._drainQueue();
+        }
       }
     });
 
@@ -258,15 +353,33 @@ class OpenSideDaemon extends EventEmitter {
         const item = this.taskQueue.shift();
         state.busy = true;
         state.activeTaskId = item.taskId;
+        this.emit('taskDispatched', { workerId, taskId: item.taskId });
 
-        state.worker.send({
-          type: 'EXECUTE_TASK',
-          taskId: item.taskId,
-          taskCode: item.taskCode,
-          inputData: item.inputData,
-          timeoutMs: item.timeoutMs,
-          memoryLimitMb: item.memoryLimitMb
-        });
+        try {
+          state.worker.send({
+            type: 'EXECUTE_TASK',
+            taskId: item.taskId,
+            taskCode: item.taskCode,
+            inputData: item.inputData,
+            timeoutMs: item.timeoutMs,
+            memoryLimitMb: item.memoryLimitMb
+          }, (err) => {
+            if (err) {
+              this.log('error', `Failed to deliver task ${item.taskId} to worker #${workerId}: ${err.message}`);
+              state.busy = false;
+              state.activeTaskId = null;
+              if (this.pendingTasks.has(item.taskId)) {
+                this.taskQueue.unshift(item);
+                this._drainQueue();
+              }
+            }
+          });
+        } catch (sendErr) {
+          this.log('error', `Exception sending task ${item.taskId} to worker #${workerId}: ${sendErr.message}`);
+          state.busy = false;
+          state.activeTaskId = null;
+          this.taskQueue.unshift(item);
+        }
       }
     }
   }
@@ -277,6 +390,15 @@ class OpenSideDaemon extends EventEmitter {
   dispatchClusterTask(taskCode, inputData, options = {}) {
     if (!this.running || this.stopping) {
       return Promise.reject(new Error('OpenSideDaemon is not running'));
+    }
+    if (!this.isMaster) {
+      return Promise.reject(new Error('dispatchClusterTask can only be executed on daemon master'));
+    }
+    if (typeof taskCode !== 'string' || taskCode.trim().length === 0) {
+      return Promise.reject(new TypeError('taskCode must be a non-empty string'));
+    }
+    if (this.options.maxQueueSize && this.taskQueue.length >= this.options.maxQueueSize) {
+      return Promise.reject(new Error(`Daemon task queue full (${this.taskQueue.length} items)`));
     }
 
     this.taskSeq += 1;
@@ -311,6 +433,29 @@ class OpenSideDaemon extends EventEmitter {
   }
 
   /**
+   * Safely transmits IPC payload from worker to master.
+   */
+  _safeWorkerSend(payload) {
+    if (process.send && process.connected !== false) {
+      try {
+        process.send(payload);
+      } catch (err) {
+        if (payload && payload.type === 'TASK_RESULT' && payload.success) {
+          try {
+            process.send({
+              type: 'TASK_RESULT',
+              taskId: payload.taskId,
+              success: false,
+              error: `IPC serialization error: ${err.message}`,
+              executionTimeMs: payload.executionTimeMs
+            });
+          } catch {}
+        }
+      }
+    }
+  }
+
+  /**
    * Worker process initialization routine.
    */
   async _startWorker() {
@@ -321,8 +466,30 @@ class OpenSideDaemon extends EventEmitter {
       enableWorkerPool: true
     });
 
+    let cleanedUp = false;
+    const cleanupWorker = async () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      try {
+        if (sandbox && typeof sandbox.terminateAllWorkers === 'function') {
+          await sandbox.terminateAllWorkers();
+        }
+      } catch {}
+      process.exit(0);
+    };
+
+    // Clean up worker threads and prevent orphan processes if master disconnects
+    process.on('disconnect', cleanupWorker);
+    process.on('SIGTERM', cleanupWorker);
+    process.on('SIGINT', cleanupWorker);
+
     process.on('message', async (msg) => {
       if (!msg || typeof msg !== 'object') return;
+
+      if (msg.type === 'SHUTDOWN') {
+        await cleanupWorker();
+        return;
+      }
 
       if (msg.type === 'EXECUTE_TASK') {
         const { taskId, taskCode, inputData, timeoutMs, memoryLimitMb } = msg;
@@ -333,7 +500,7 @@ class OpenSideDaemon extends EventEmitter {
             { timeoutMs: timeoutMs || 15000, memoryLimitMb: memoryLimitMb || 64 }
           );
           const executionTimeMs = performance.now() - t0;
-          process.send({
+          this._safeWorkerSend({
             type: 'TASK_RESULT',
             taskId,
             success: true,
@@ -342,7 +509,7 @@ class OpenSideDaemon extends EventEmitter {
           });
         } catch (err) {
           const executionTimeMs = performance.now() - t0;
-          process.send({
+          this._safeWorkerSend({
             type: 'TASK_RESULT',
             taskId,
             success: false,
@@ -354,9 +521,11 @@ class OpenSideDaemon extends EventEmitter {
     });
 
     // Notify master that this worker is ready for computation
-    if (process.send) {
-      process.send({ type: 'READY', workerId: cluster.worker ? cluster.worker.id : null, pid: process.pid });
-    }
+    this._safeWorkerSend({
+      type: 'READY',
+      workerId: cluster.worker ? cluster.worker.id : null,
+      pid: process.pid
+    });
 
     this.emit('started', { mode: 'worker', pid: process.pid });
     return this;
@@ -366,9 +535,20 @@ class OpenSideDaemon extends EventEmitter {
    * Wires graceful signal handlers.
    */
   _bindSignals() {
+    let teardownInitiated = false;
     const handleSignal = (sig) => {
+      if (teardownInitiated) {
+        this.log('warn', `Received secondary signal ${sig}, forcing immediate exit`);
+        process.exit(1);
+      }
+      teardownInitiated = true;
       this.log('info', `Received signal ${sig}, initiating graceful teardown...`);
-      this.stop(sig).catch((err) => {
+
+      this.stop(sig).then(() => {
+        if (require.main === module || this.options.exitOnSignal) {
+          process.exit(0);
+        }
+      }).catch((err) => {
         this.log('error', `Error during graceful shutdown: ${err.message}`);
         process.exit(1);
       });
@@ -377,6 +557,11 @@ class OpenSideDaemon extends EventEmitter {
     this._exitHandler = handleSignal;
     process.once('SIGINT', handleSignal);
     process.once('SIGTERM', handleSignal);
+    if (process.platform === 'win32') {
+      process.once('SIGBREAK', handleSignal);
+    } else {
+      process.once('SIGHUP', handleSignal);
+    }
   }
 
   /**
@@ -391,6 +576,18 @@ class OpenSideDaemon extends EventEmitter {
     if (this._exitHandler) {
       process.removeListener('SIGINT', this._exitHandler);
       process.removeListener('SIGTERM', this._exitHandler);
+      if (process.platform === 'win32') {
+        process.removeListener('SIGBREAK', this._exitHandler);
+      } else {
+        process.removeListener('SIGHUP', this._exitHandler);
+      }
+      this._exitHandler = null;
+    }
+
+    // Clean process exit hook
+    if (this._processExitHook) {
+      process.removeListener('exit', this._processExitHook);
+      this._processExitHook = null;
     }
 
     // Close HTTP gateway if running
@@ -428,7 +625,12 @@ class OpenSideDaemon extends EventEmitter {
             state.worker.once('disconnect', () => resolve());
             state.worker.once('exit', () => resolve());
             try {
-              state.worker.disconnect();
+              if (state.worker.isConnected()) {
+                state.worker.send({ type: 'SHUTDOWN' });
+                state.worker.disconnect();
+              } else {
+                state.worker.kill('SIGTERM');
+              }
             } catch {
               try { state.worker.kill(); } catch {}
               resolve();
@@ -455,13 +657,13 @@ class OpenSideDaemon extends EventEmitter {
       this.removePid();
     }
 
-    if (this.logStream && !this.logStream.destroyed) {
-      this.logStream.end();
-    }
-
     this.running = false;
     this.emit('stopped', { reason });
     this.log('info', 'OpenSideDaemon stopped cleanly.');
+
+    if (this.logStream && !this.logStream.destroyed && !this.logStream.writableEnded) {
+      this.logStream.end();
+    }
   }
 
   /**

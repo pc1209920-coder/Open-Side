@@ -42,22 +42,29 @@ function compareDistance(distA, distB) {
 
 /**
  * Normalizes an arbitrary string or buffer ID to a 20-byte Node ID Buffer.
+ * Defensively copies buffer instances to prevent mutation leaks.
  * If input is a hex string of length 40, decodes it.
  * Otherwise hashes it with SHA-256 and takes first 20 bytes.
- * @param {string|Buffer} rawId
+ * @param {string|Buffer|Uint8Array} rawId
  * @returns {Buffer}
  */
 function normalizeNodeId(rawId) {
   if (Buffer.isBuffer(rawId)) {
-    if (rawId.length === ID_BYTES) return rawId;
-    if (rawId.length > ID_BYTES) return rawId.subarray(0, ID_BYTES);
-    return crypto.createHash('sha256').update(rawId).digest().subarray(0, ID_BYTES);
+    if (rawId.length === ID_BYTES) return Buffer.from(rawId);
+    if (rawId.length > ID_BYTES) return Buffer.from(rawId.subarray(0, ID_BYTES));
+    return Buffer.from(crypto.createHash('sha256').update(rawId).digest().subarray(0, ID_BYTES));
+  }
+  if (rawId instanceof Uint8Array) {
+    const buf = Buffer.from(rawId);
+    if (buf.length === ID_BYTES) return buf;
+    if (buf.length > ID_BYTES) return Buffer.from(buf.subarray(0, ID_BYTES));
+    return Buffer.from(crypto.createHash('sha256').update(buf).digest().subarray(0, ID_BYTES));
   }
   if (typeof rawId === 'string') {
     if (/^[0-9a-fA-F]{40}$/.test(rawId)) {
       return Buffer.from(rawId, 'hex');
     }
-    return crypto.createHash('sha256').update(rawId, 'utf8').digest().subarray(0, ID_BYTES);
+    return Buffer.from(crypto.createHash('sha256').update(rawId, 'utf8').digest().subarray(0, ID_BYTES));
   }
   throw new TypeError('Invalid rawId: must be string or Buffer');
 }
@@ -89,14 +96,53 @@ function getBucketIndex(localId, targetId) {
 }
 
 /**
+ * Generates a random 160-bit node ID that falls exactly into the specified bucket
+ * relative to the given local node ID. Used for Kademlia bucket refresh and partition recovery.
+ * @param {Buffer} localIdBuffer
+ * @param {number} bucketIdx (0 to 159)
+ * @returns {Buffer}
+ */
+function generateRandomIdInBucket(localIdBuffer, bucketIdx) {
+  if (!Buffer.isBuffer(localIdBuffer) || localIdBuffer.length !== ID_BYTES) {
+    throw new TypeError(`localIdBuffer must be a Buffer of length ${ID_BYTES}`);
+  }
+  if (typeof bucketIdx !== 'number' || bucketIdx < 0 || bucketIdx >= ID_BITS) {
+    throw new RangeError(`bucketIdx must be an integer between 0 and ${ID_BITS - 1}`);
+  }
+
+  const result = Buffer.from(localIdBuffer);
+  const targetByteIdx = Math.floor(bucketIdx / 8);
+  const bitOffsetInByte = bucketIdx % 8;
+  const mask = 0x80 >> bitOffsetInByte;
+
+  // Invert the differing bit
+  result[targetByteIdx] ^= mask;
+
+  // Randomize lower bits in the same byte if any
+  if (bitOffsetInByte < 7) {
+    const lowerMask = (1 << (7 - bitOffsetInByte)) - 1;
+    const randByte = crypto.randomBytes(1)[0];
+    result[targetByteIdx] = (result[targetByteIdx] & ~lowerMask) | (randByte & lowerMask);
+  }
+
+  // Randomize all subsequent bytes
+  for (let b = targetByteIdx + 1; b < ID_BYTES; b++) {
+    result[b] = crypto.randomBytes(1)[0];
+  }
+
+  return result;
+}
+
+/**
  * KBucket represents a bucket of up to k contacts.
- * Implements LRU eviction replacement policy.
+ * Implements LRU eviction replacement policy and candidate replacement cache.
  */
 class KBucket {
   constructor(index, k = DEFAULT_K) {
     this.index = index;
     this.k = k;
     this.contacts = []; // Ordered from least-recently-seen (head) to most-recently-seen (tail)
+    this.replacementCache = []; // Candidate contacts queued when bucket is full (FIFO)
   }
 
   get length() {
@@ -104,7 +150,13 @@ class KBucket {
   }
 
   getContact(nodeId) {
-    const idBuf = normalizeNodeId(nodeId);
+    if (!nodeId) return null;
+    let idBuf;
+    try {
+      idBuf = normalizeNodeId(nodeId);
+    } catch {
+      return null;
+    }
     return this.contacts.find((c) => c.idBuffer.equals(idBuf)) || null;
   }
 
@@ -112,12 +164,12 @@ class KBucket {
    * Adds or updates a contact.
    * If contact already exists, moves it to tail (most-recently seen).
    * If bucket is not full, appends to tail.
-   * If full, returns { overflow: true, staleContact: oldestContact } so caller can ping oldest.
+   * If full, queues candidate in replacementCache and returns { status: 'FULL', staleContact, candidateContact }.
    * @param {object} contact
-   * @returns {{ status: 'UPDATED'|'ADDED'|'FULL', staleContact?: object }}
+   * @returns {{ status: 'UPDATED'|'ADDED'|'FULL', contact?: object, staleContact?: object, candidateContact?: object }}
    */
   add(contact) {
-    if (!contact || !contact.id) {
+    if (!contact || typeof contact !== 'object' || !contact.id) {
       throw new TypeError('Invalid contact object: must contain id');
     }
     const idBuffer = normalizeNodeId(contact.id);
@@ -141,7 +193,16 @@ class KBucket {
       return { status: 'ADDED', contact: normalizedContact };
     }
 
-    // Bucket is full; oldest is at index 0
+    // Bucket is full; maintain candidate in replacement cache
+    const replIdx = this.replacementCache.findIndex((c) => c.idBuffer.equals(idBuffer));
+    if (replIdx !== -1) {
+      this.replacementCache.splice(replIdx, 1);
+    } else if (this.replacementCache.length >= this.k) {
+      this.replacementCache.shift(); // Evict oldest candidate from replacement cache
+    }
+    this.replacementCache.push(normalizedContact);
+
+    // Oldest contact is at index 0
     return {
       status: 'FULL',
       staleContact: this.contacts[0],
@@ -150,16 +211,33 @@ class KBucket {
   }
 
   /**
-   * Removes a contact by id.
+   * Removes a contact by id. If a replacement candidate exists in replacementCache,
+   * promotes it to the active bucket.
    * @param {string|Buffer} nodeId
    * @returns {boolean}
    */
   remove(nodeId) {
-    const idBuf = normalizeNodeId(nodeId);
+    if (!nodeId) return false;
+    let idBuf;
+    try {
+      idBuf = normalizeNodeId(nodeId);
+    } catch {
+      return false;
+    }
     const idx = this.contacts.findIndex((c) => c.idBuffer.equals(idBuf));
     if (idx !== -1) {
       this.contacts.splice(idx, 1);
+      // Promote oldest candidate from replacementCache if present
+      if (this.replacementCache.length > 0) {
+        const promoted = this.replacementCache.shift();
+        this.contacts.push(promoted);
+      }
       return true;
+    }
+    // Also remove from replacementCache if present
+    const replIdx = this.replacementCache.findIndex((c) => c.idBuffer.equals(idBuf));
+    if (replIdx !== -1) {
+      this.replacementCache.splice(replIdx, 1);
     }
     return false;
   }
@@ -191,6 +269,24 @@ class RoutingTable extends EventEmitter {
   }
 
   /**
+   * Gets a contact by ID if present.
+   * @param {string|Buffer} nodeId
+   * @returns {object|null}
+   */
+  getContact(nodeId) {
+    if (!nodeId) return null;
+    let targetBuffer;
+    try {
+      targetBuffer = normalizeNodeId(nodeId);
+    } catch {
+      return null;
+    }
+    const bucketIdx = getBucketIndex(this.localIdBuffer, targetBuffer);
+    if (bucketIdx < 0 || bucketIdx >= ID_BITS) return null;
+    return this.buckets[bucketIdx].getContact(targetBuffer);
+  }
+
+  /**
    * Adds or updates a contact in the appropriate bucket.
    * @param {object} contact { id, address, port, ... }
    * @returns {object} Result from bucket addition
@@ -213,6 +309,12 @@ class RoutingTable extends EventEmitter {
     const res = bucket.add(contact);
     if (res.status === 'ADDED' || res.status === 'UPDATED') {
       this.emit('contactUpdated', res.contact || contact);
+    } else if (res.status === 'FULL') {
+      this.emit('bucketFull', {
+        bucketIdx,
+        staleContact: res.staleContact,
+        candidateContact: res.candidateContact
+      });
     }
     return res;
   }
@@ -223,7 +325,13 @@ class RoutingTable extends EventEmitter {
    * @returns {boolean}
    */
   removeContact(nodeId) {
-    const targetBuffer = normalizeNodeId(nodeId);
+    if (!nodeId) return false;
+    let targetBuffer;
+    try {
+      targetBuffer = normalizeNodeId(nodeId);
+    } catch {
+      return false;
+    }
     const bucketIdx = getBucketIndex(this.localIdBuffer, targetBuffer);
     if (bucketIdx < 0 || bucketIdx >= ID_BITS) return false;
 
@@ -283,18 +391,56 @@ class KademliaDHT extends EventEmitter {
     this.k = options.k || DEFAULT_K;
     this.alpha = options.alpha || DEFAULT_ALPHA;
     this.storageTtlMs = options.storageTtlMs || 3600000; // 1 hour default TTL for stored values
+    this.maxFailures = typeof options.maxFailures === 'number' ? options.maxFailures : 3;
 
     this.routingTable = new RoutingTable(this.localIdBuffer, { k: this.k });
     // Local key-value store: key (hex/string) -> { value, publisher, storedAt, expiresAt }
     this.store = new Map();
 
+    // Bootstrap seed nodes retained for partition recovery
+    this.bootstrapNodes = [];
+
+    // Peer failure counter: peerId -> consecutive failure count
+    this._peerFailures = new Map();
+
     // RPC transport hook: function(targetContact, rpcType, payload) => Promise<response>
     this.rpcHandler = typeof options.rpcHandler === 'function' ? options.rpcHandler : null;
+
+    // Automatic periodic sweep timer
+    this._sweepInterval = null;
+    if (options.autoSweepIntervalMs) {
+      this.startPeriodicSweep(options.autoSweepIntervalMs);
+    }
   }
 
   setRpcHandler(fn) {
     if (typeof fn !== 'function') throw new TypeError('RPC handler must be a function');
     this.rpcHandler = fn;
+  }
+
+  /**
+   * Pings the stale contact when a bucket is full. If unreachable, evicts it
+   * and inserts the candidate contact.
+   * @param {object} staleContact
+   * @param {object} candidateContact
+   * @returns {Promise<boolean>}
+   */
+  async pingAndEvict(staleContact, candidateContact) {
+    if (!this.rpcHandler || !staleContact || !candidateContact) return false;
+    try {
+      const res = await this.rpcHandler(staleContact, 'PING', {});
+      if (res && res.type === 'PONG') {
+        // Stale contact is alive: refresh to tail
+        this.routingTable.addContact(staleContact);
+        return false;
+      }
+      throw new Error('Invalid PING response');
+    } catch {
+      // Stale contact unreachable: evict and insert candidate
+      this.routingTable.removeContact(staleContact.id);
+      this.routingTable.addContact(candidateContact);
+      return true;
+    }
   }
 
   /**
@@ -308,12 +454,25 @@ class KademliaDHT extends EventEmitter {
       throw new TypeError('bootstrapNodes must be an Array');
     }
 
+    // Preserve bootstrap seed nodes for network partition recovery
+    for (const node of bootstrapNodes) {
+      if (node && node.id) {
+        const idBuf = normalizeNodeId(node.id);
+        const hexId = idBuf.toString('hex');
+        if (!this.bootstrapNodes.some((b) => b.id === hexId)) {
+          this.bootstrapNodes.push({ ...node, id: hexId });
+        }
+      }
+    }
+
     let added = 0;
     for (const node of bootstrapNodes) {
       if (node && node.id) {
         const res = this.routingTable.addContact(node);
         if (res.status === 'ADDED' || res.status === 'UPDATED') {
           added++;
+        } else if (res.status === 'FULL') {
+          this.pingAndEvict(res.staleContact, res.candidateContact).catch(() => {});
         }
       }
     }
@@ -328,7 +487,34 @@ class KademliaDHT extends EventEmitter {
   }
 
   /**
+   * Re-bootstraps using preserved seed nodes to recover after network partition.
+   * @returns {Promise<number>}
+   */
+  async rebootstrap() {
+    if (this.bootstrapNodes.length === 0) return 0;
+    return this.bootstrap(this.bootstrapNodes);
+  }
+
+  /**
+   * Refreshes active buckets by looking up random keys in their distance ranges.
+   * Kademlia RFC partition recovery mechanism.
+   * @returns {Promise<void>}
+   */
+  async refreshBuckets() {
+    if (!this.rpcHandler) return;
+    const promises = [];
+    for (let i = 0; i < ID_BITS; i++) {
+      if (this.routingTable.buckets[i].length > 0) {
+        const randomTarget = generateRandomIdInBucket(this.localIdBuffer, i);
+        promises.push(this.lookupNode(randomTarget).catch(() => {}));
+      }
+    }
+    await Promise.all(promises);
+  }
+
+  /**
    * Stores a key-value pair locally with TTL.
+   * Validates non-negative numeric TTL to prevent string concatenation and NaN bugs.
    * @param {string} key
    * @param {*} value
    * @param {object} [options]
@@ -337,7 +523,9 @@ class KademliaDHT extends EventEmitter {
     if (typeof key !== 'string' || !key) {
       throw new TypeError('Invalid key: must be a non-empty string');
     }
-    const ttl = options.ttlMs || this.storageTtlMs;
+    const ttl = (typeof options.ttlMs === 'number' && Number.isFinite(options.ttlMs) && options.ttlMs >= 0)
+      ? options.ttlMs
+      : this.storageTtlMs;
     const now = Date.now();
     const entry = {
       key,
@@ -357,13 +545,74 @@ class KademliaDHT extends EventEmitter {
    * @returns {*|null}
    */
   getLocal(key) {
+    if (typeof key !== 'string' || !key) return null;
     const entry = this.store.get(key);
     if (!entry) return null;
     if (Date.now() > entry.expiresAt) {
       this.store.delete(key);
+      this.emit('valueExpired', { key, publisher: entry.publisher });
       return null;
     }
     return entry.value;
+  }
+
+  /**
+   * Checks whether a valid unexpired value exists locally for key.
+   * Unlike getLocal, correctly distinguishes between missing keys and stored null/false/0 values.
+   * @param {string} key
+   * @returns {boolean}
+   */
+  hasLocal(key) {
+    if (typeof key !== 'string' || !key) return false;
+    const entry = this.store.get(key);
+    if (!entry) return false;
+    if (Date.now() > entry.expiresAt) {
+      this.store.delete(key);
+      this.emit('valueExpired', { key, publisher: entry.publisher });
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Actively purges all expired entries from local storage to prevent memory leaks.
+   * @returns {number} Count of purged keys
+   */
+  purgeExpired() {
+    const now = Date.now();
+    let purged = 0;
+    for (const [key, entry] of this.store.entries()) {
+      if (now > entry.expiresAt) {
+        this.store.delete(key);
+        this.emit('valueExpired', { key, publisher: entry.publisher });
+        purged++;
+      }
+    }
+    return purged;
+  }
+
+  /**
+   * Starts periodic active background sweep of expired keys.
+   * @param {number} [intervalMs=60000]
+   */
+  startPeriodicSweep(intervalMs = 60000) {
+    this.stopPeriodicSweep();
+    this._sweepInterval = setInterval(() => {
+      this.purgeExpired();
+    }, intervalMs);
+    if (this._sweepInterval && this._sweepInterval.unref) {
+      this._sweepInterval.unref();
+    }
+  }
+
+  /**
+   * Stops periodic background sweep.
+   */
+  stopPeriodicSweep() {
+    if (this._sweepInterval) {
+      clearInterval(this._sweepInterval);
+      this._sweepInterval = null;
+    }
   }
 
   /**
@@ -380,7 +629,10 @@ class KademliaDHT extends EventEmitter {
     }
 
     // Refresh sender in routing table
-    this.routingTable.addContact(senderContact);
+    const addRes = this.routingTable.addContact(senderContact);
+    if (addRes && addRes.status === 'FULL') {
+      this.pingAndEvict(addRes.staleContact, addRes.candidateContact).catch(() => {});
+    }
 
     switch (rpcType) {
       case 'PING':
@@ -388,7 +640,7 @@ class KademliaDHT extends EventEmitter {
 
       case 'STORE': {
         const { key, value, ttlMs } = payload;
-        if (!key) throw new Error('STORE RPC requires key');
+        if (!key || typeof key !== 'string') throw new Error('STORE RPC requires non-empty string key');
         this.storeLocal(key, value, { publisher: senderContact.id, ttlMs });
         return { type: 'STORE_OK', stored: true };
       }
@@ -404,9 +656,9 @@ class KademliaDHT extends EventEmitter {
 
       case 'FIND_VALUE': {
         const { key } = payload;
-        const localVal = this.getLocal(key);
-        if (localVal !== null && localVal !== undefined) {
-          return { type: 'VALUE', key, value: localVal };
+        if (!key || typeof key !== 'string') throw new Error('FIND_VALUE RPC requires non-empty string key');
+        if (this.hasLocal(key)) {
+          return { type: 'VALUE', key, value: this.getLocal(key) };
         }
         // Not found locally; return k closest nodes to key
         const closest = this.routingTable.findClosestNodes(key, this.k);
@@ -424,6 +676,7 @@ class KademliaDHT extends EventEmitter {
   /**
    * Iterative lookup algorithm to find k closest nodes to targetId.
    * Queries peers in parallel with alpha concurrency.
+   * Terminates when all k closest candidates have been queried or search space exhausted.
    * @param {string|Buffer} targetId
    * @returns {Promise<Array<object>>}
    */
@@ -432,8 +685,8 @@ class KademliaDHT extends EventEmitter {
       return this.routingTable.findClosestNodes(targetId, this.k);
     }
 
-    const targetKey = typeof targetId === 'string' ? targetId : targetId.toString('hex');
     const targetBuffer = normalizeNodeId(targetId);
+    const targetKey = targetBuffer.toString('hex');
 
     // Initial shortlist: alpha closest from local routing table
     const shortlist = this.routingTable.findClosestNodes(targetBuffer, this.alpha);
@@ -458,20 +711,40 @@ class KademliaDHT extends EventEmitter {
         contacted.add(peer.id);
         try {
           const res = await this.rpcHandler(peer, 'FIND_NODE', { targetId: targetKey });
+          this._peerFailures.delete(peer.id);
+
           if (res && Array.isArray(res.nodes)) {
             for (const n of res.nodes) {
-              if (n && n.id && n.id !== this.localId && !candidateMap.has(n.id)) {
-                this.routingTable.addContact(n);
-                candidateMap.set(n.id, {
+              if (!n || !n.id) continue;
+              let nBuf;
+              try {
+                nBuf = normalizeNodeId(n.id);
+              } catch {
+                continue;
+              }
+              if (nBuf.equals(this.localIdBuffer)) continue;
+              const nHex = nBuf.toString('hex');
+              if (!candidateMap.has(nHex)) {
+                const normalizedPeer = {
                   ...n,
-                  idBuffer: normalizeNodeId(n.id)
-                });
+                  id: nHex,
+                  idBuffer: nBuf
+                };
+                candidateMap.set(nHex, normalizedPeer);
+                const addRes = this.routingTable.addContact(normalizedPeer);
+                if (addRes && addRes.status === 'FULL') {
+                  this.pingAndEvict(addRes.staleContact, addRes.candidateContact).catch(() => {});
+                }
               }
             }
           }
         } catch {
-          // Unreachable peer; remove or mark failed
-          this.routingTable.removeContact(peer.id);
+          // Unreachable peer with tolerance counter
+          const fails = (this._peerFailures.get(peer.id) || 0) + 1;
+          this._peerFailures.set(peer.id, fails);
+          if (fails >= this.maxFailures) {
+            this.routingTable.removeContact(peer.id);
+          }
         }
       });
 
@@ -479,7 +752,16 @@ class KademliaDHT extends EventEmitter {
 
       // Refresh unqueried
       unqueried = Array.from(candidateMap.values()).filter((c) => !contacted.has(c.id));
-      if (unqueried.length === 0 || contacted.size >= this.k) {
+
+      // Kademlia convergence condition: terminate when top k closest nodes have all been queried
+      const sortedCandidates = Array.from(candidateMap.values())
+        .map((c) => ({ contact: c, dist: xorDistance(c.idBuffer, targetBuffer) }))
+        .sort((a, b) => compareDistance(a.dist, b.dist));
+
+      const kClosest = sortedCandidates.slice(0, this.k);
+      const allKClosestQueried = kClosest.length > 0 && kClosest.every((item) => contacted.has(item.contact.id));
+
+      if (unqueried.length === 0 || allKClosestQueried) {
         break;
       }
     }
@@ -502,9 +784,8 @@ class KademliaDHT extends EventEmitter {
    * @returns {Promise<{ found: boolean, value?: any, closestNodes?: Array<object> }>}
    */
   async lookupValue(key) {
-    const local = this.getLocal(key);
-    if (local !== null && local !== undefined) {
-      return { found: true, value: local, provider: this.localId };
+    if (this.hasLocal(key)) {
+      return { found: true, value: this.getLocal(key), provider: this.localId };
     }
 
     if (!this.rpcHandler) {
@@ -523,43 +804,78 @@ class KademliaDHT extends EventEmitter {
     let unqueried = shortlist.filter((c) => !contacted.has(c.id));
 
     while (unqueried.length > 0) {
-      const batch = unqueried.slice(0, this.alpha);
-      let foundValue = null;
+      // Pick up to alpha unqueried nodes sorted by XOR distance to key
+      const batch = unqueried
+        .map((c) => ({ contact: c, dist: xorDistance(c.idBuffer, keyBuffer) }))
+        .sort((a, b) => compareDistance(a.dist, b.dist))
+        .slice(0, this.alpha)
+        .map((item) => item.contact);
+
+      let foundValue = undefined;
       let valueProvider = null;
+      let hasFound = false;
 
       const promises = batch.map(async (peer) => {
         contacted.add(peer.id);
         try {
           const res = await this.rpcHandler(peer, 'FIND_VALUE', { key });
+          this._peerFailures.delete(peer.id);
           if (res && res.type === 'VALUE') {
             foundValue = res.value;
             valueProvider = peer.id;
+            hasFound = true;
           } else if (res && Array.isArray(res.nodes)) {
             for (const n of res.nodes) {
-              if (n && n.id && n.id !== this.localId && !candidateMap.has(n.id)) {
-                this.routingTable.addContact(n);
-                candidateMap.set(n.id, {
+              if (!n || !n.id) continue;
+              let nBuf;
+              try {
+                nBuf = normalizeNodeId(n.id);
+              } catch {
+                continue;
+              }
+              if (nBuf.equals(this.localIdBuffer)) continue;
+              const nHex = nBuf.toString('hex');
+              if (!candidateMap.has(nHex)) {
+                const normalizedPeer = {
                   ...n,
-                  idBuffer: normalizeNodeId(n.id)
-                });
+                  id: nHex,
+                  idBuffer: nBuf
+                };
+                candidateMap.set(nHex, normalizedPeer);
+                const addRes = this.routingTable.addContact(normalizedPeer);
+                if (addRes && addRes.status === 'FULL') {
+                  this.pingAndEvict(addRes.staleContact, addRes.candidateContact).catch(() => {});
+                }
               }
             }
           }
         } catch {
-          this.routingTable.removeContact(peer.id);
+          const fails = (this._peerFailures.get(peer.id) || 0) + 1;
+          this._peerFailures.set(peer.id, fails);
+          if (fails >= this.maxFailures) {
+            this.routingTable.removeContact(peer.id);
+          }
         }
       });
 
       await Promise.all(promises);
 
-      if (foundValue !== null && foundValue !== undefined) {
+      if (hasFound) {
         // Cache value locally (Kademlia caching heuristic)
         this.storeLocal(key, foundValue);
         return { found: true, value: foundValue, provider: valueProvider };
       }
 
       unqueried = Array.from(candidateMap.values()).filter((c) => !contacted.has(c.id));
-      if (unqueried.length === 0 || contacted.size >= this.k) {
+
+      const sortedCandidates = Array.from(candidateMap.values())
+        .map((c) => ({ contact: c, dist: xorDistance(c.idBuffer, keyBuffer) }))
+        .sort((a, b) => compareDistance(a.dist, b.dist));
+
+      const kClosest = sortedCandidates.slice(0, this.k);
+      const allKClosestQueried = kClosest.length > 0 && kClosest.every((item) => contacted.has(item.contact.id));
+
+      if (unqueried.length === 0 || allKClosestQueried) {
         break;
       }
     }
@@ -581,11 +897,18 @@ class KademliaDHT extends EventEmitter {
    * @returns {Promise<{ storedNodes: number, targetNodes: number }>}
    */
   async storeValue(key, value, options = {}) {
+    if (typeof key !== 'string' || !key) {
+      throw new TypeError('Invalid key: must be a non-empty string');
+    }
     this.storeLocal(key, value, options);
 
     if (!this.rpcHandler) {
       return { storedNodes: 1, targetNodes: 1 };
     }
+
+    const ttlMs = (typeof options.ttlMs === 'number' && Number.isFinite(options.ttlMs) && options.ttlMs >= 0)
+      ? options.ttlMs
+      : this.storageTtlMs;
 
     const closestNodes = await this.lookupNode(key);
     let successfulStores = 1; // Count local node
@@ -595,7 +918,7 @@ class KademliaDHT extends EventEmitter {
         const res = await this.rpcHandler(peer, 'STORE', {
           key,
           value,
-          ttlMs: options.ttlMs || this.storageTtlMs
+          ttlMs
         });
         if (res && res.stored) {
           successfulStores++;
@@ -608,6 +931,15 @@ class KademliaDHT extends EventEmitter {
     await Promise.all(storePromises);
     return { storedNodes: successfulStores, targetNodes: closestNodes.length + 1 };
   }
+
+  /**
+   * Gracefully tears down DHT node and clears background sweep intervals.
+   */
+  destroy() {
+    this.stopPeriodicSweep();
+    this.store.clear();
+    this.removeAllListeners();
+  }
 }
 
 module.exports = {
@@ -618,6 +950,7 @@ module.exports = {
   compareDistance,
   normalizeNodeId,
   getBucketIndex,
+  generateRandomIdInBucket,
   DEFAULT_K,
   DEFAULT_ALPHA,
   ID_BITS,

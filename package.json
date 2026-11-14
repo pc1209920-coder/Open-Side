@@ -1,16 +1,33 @@
 {
   "name": "open-side-protocol",
-  "version": "1.0.0",
+  "version": "0.9.0-beta",
   "description": "Hardware-agnostic, zero-dependency decentralized P2P standby compute grid (Single Compute Sea protocol) pooling idle hardware for distributed task execution.",
   "main": "src/index.js",
   "type": "commonjs",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "ROADMAP.md"
+  ],
   "scripts": {
     "start": "node src/index.js",
     "daemon": "node src/daemon.js",
     "gateway": "node -e \"const { OpenSideGateway } = require('./src/index'); new OpenSideGateway().start();\"",
+    "check": "node -e \"const { execFileSync } = require('child_process'), fs = require('fs'), path = require('path'); function check(dir) { for (const f of fs.readdirSync(dir, { withFileTypes: true })) { const p = path.join(dir, f.name); if (f.isDirectory()) check(p); else if (f.name.endsWith('.js')) execFileSync(process.execPath, ['--check', p]); } } check('src'); console.log('Syntax check passed across all src modules.');\"",
+    "verify:deps": "node -e \"const pkg = require('./package.json'); if (Object.keys(pkg.dependencies || {}).length || Object.keys(pkg.devDependencies || {}).length) process.exit(1); console.log('Zero dependencies verified.');\"",
     "test": "node --test",
     "test:ci": "node --test --test-concurrency=1"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pc1209920-coder/Open-Side.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pc1209920-coder/Open-Side/issues"
+  },
+  "homepage": "https://github.com/pc1209920-coder/Open-Side#readme",
   "keywords": [
     "grid-computing",
     "distributed-systems",
@@ -27,7 +44,7 @@
     "wasm",
     "ai-gateway"
   ],
-  "author": "pc1209920-coder",
+  "author": "Pratyush Chaudhary (pc1209920-coder)",
   "license": "MIT",
   "engines": {
     "node": ">=18.0.0"
