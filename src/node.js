@@ -236,6 +236,8 @@ class P2PNode extends EventEmitter {
     this._socketMeta = new WeakMap();
     this._pendingShards = new Map();
     this._seenHandshakeNonces = new Set();
+    this.pinnedPeerKeys = new Map();
+    this.requireHandshakeSignature = Boolean(options.requireHandshakeSignature);
     this._listeningPromise = null;
     this._closePromise = null;
     this._closing = false;
@@ -1258,6 +1260,18 @@ class P2PNode extends EventEmitter {
       return;
     }
 
+    // TOFU (Trust-On-First-Use) Key Pinning
+    const pinnedKey = this.pinnedPeerKeys.get(msg.nodeId);
+    if (pinnedKey && pinnedKey !== msg.publicKey) {
+      this._failSocket(socket, new Error(`Handshake failed: TOFU key mismatch for peer ${msg.nodeId}`));
+      return;
+    }
+
+    if (this.requireHandshakeSignature && (!msg.signature || !msg.identityPublicKey)) {
+      this._failSocket(socket, new Error('Handshake failed: mandatory Ed25519 identity signature missing'));
+      return;
+    }
+
     if (msg.signature && msg.identityPublicKey && this.crypto && typeof this.crypto.verifyAttestation === 'function') {
       const transcript = `${msg.nodeId}:${msg.publicKey}:${msg.epoch}:${msg.timestamp}:${msg.nonce}`;
       const valid = this.crypto.verifyAttestation(transcript, undefined, msg.signature, msg.identityPublicKey);
@@ -1265,6 +1279,10 @@ class P2PNode extends EventEmitter {
         this._failSocket(socket, new Error('Handshake failed: invalid Ed25519 transcript signature'));
         return;
       }
+    }
+
+    if (!pinnedKey) {
+      this.pinnedPeerKeys.set(msg.nodeId, msg.publicKey);
     }
 
     let agreedEpoch = msg.epoch;
@@ -1357,6 +1375,18 @@ class P2PNode extends EventEmitter {
       return;
     }
 
+    // TOFU (Trust-On-First-Use) Key Pinning
+    const pinnedKey = this.pinnedPeerKeys.get(msg.nodeId);
+    if (pinnedKey && pinnedKey !== msg.publicKey) {
+      this._failSocket(socket, new Error(`Handshake failed: TOFU key mismatch for peer ${msg.nodeId}`));
+      return;
+    }
+
+    if (this.requireHandshakeSignature && (!msg.signature || !msg.identityPublicKey)) {
+      this._failSocket(socket, new Error('Handshake failed: mandatory Ed25519 identity signature missing'));
+      return;
+    }
+
     if (msg.signature && msg.identityPublicKey && this.crypto && typeof this.crypto.verifyAttestation === 'function') {
       const transcript = `${msg.nodeId}:${msg.publicKey}:${msg.epoch}:${msg.timestamp}:${msg.nonce}`;
       const valid = this.crypto.verifyAttestation(transcript, undefined, msg.signature, msg.identityPublicKey);
@@ -1364,6 +1394,10 @@ class P2PNode extends EventEmitter {
         this._failSocket(socket, new Error('Handshake failed: invalid Ed25519 transcript signature'));
         return;
       }
+    }
+
+    if (!pinnedKey) {
+      this.pinnedPeerKeys.set(msg.nodeId, msg.publicKey);
     }
 
     if (msg.epoch !== pending.epoch) {

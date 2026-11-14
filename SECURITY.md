@@ -5,7 +5,6 @@
 | Version    | Supported          |
 | ---------- | ------------------ |
 | 0.9.x-beta | :white_check_mark: |
-| 1.0.x      | :white_check_mark: |
 | < 0.9.0    | :x:                |
 
 ## Zero-Trust Architecture & Fail-Closed Guarantees

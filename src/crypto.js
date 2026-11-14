@@ -110,6 +110,7 @@ class MeshCryptoEngine {
 
     this.allowOutOfOrder = typeof opts.allowOutOfOrder === 'boolean' ? opts.allowOutOfOrder : true;
     this.peerReplayStates = new Map();
+    this.peerNonceFloors = new Map();
     this.inboundNonces = this.peerReplayStates;
     this.peerReplayWindows = this.peerReplayStates;
     this.replayWindows = this.peerReplayStates;
@@ -461,10 +462,15 @@ class MeshCryptoEngine {
     while (this.peerReplayStates.size >= this.maxTrackedPeers) {
       const oldestPeerId = this.peerReplayStates.keys().next().value;
       if (oldestPeerId === undefined) break;
+      const evictedState = this.peerReplayStates.get(oldestPeerId);
+      if (evictedState && evictedState.maxNonce > 0) {
+        this.peerNonceFloors.set(oldestPeerId, Math.max(this.peerNonceFloors.get(oldestPeerId) || 0, evictedState.maxNonce));
+      }
       this.peerReplayStates.delete(oldestPeerId);
     }
 
-    state = { maxNonce: 0, lastNonce: 0, seenNonces: new Set(), windowSize };
+    const initialFloor = this.peerNonceFloors.get(peerNodeId) || 0;
+    state = { maxNonce: initialFloor, lastNonce: initialFloor, seenNonces: new Set(), windowSize };
     this.peerReplayStates.set(peerNodeId, state);
     return state;
   }
@@ -566,8 +572,9 @@ class MeshCryptoEngine {
     }
 
     const existingState = this.peerReplayStates.get(peerNodeId);
-    const maxNonce = existingState ? existingState.maxNonce : 0;
-    const lastNonce = existingState ? existingState.lastNonce : 0;
+    const nonceFloor = this.peerNonceFloors.get(peerNodeId) || 0;
+    const maxNonce = existingState ? existingState.maxNonce : nonceFloor;
+    const lastNonce = existingState ? existingState.lastNonce : nonceFloor;
 
     if (strict) {
       if (nonce <= lastNonce) {
@@ -778,8 +785,10 @@ class MeshCryptoEngine {
   resetReplayState(peerNodeId) {
     if (typeof peerNodeId === 'string' && peerNodeId.length > 0) {
       this.peerReplayStates.delete(peerNodeId);
+      this.peerNonceFloors.delete(peerNodeId);
     } else {
       this.peerReplayStates.clear();
+      this.peerNonceFloors.clear();
     }
   }
 

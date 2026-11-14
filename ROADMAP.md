@@ -1,6 +1,6 @@
 # Open-Side Protocol — Full Roadmap
 
-## Current State (v0.9.0-beta)
+## Current State (v0.9.1-beta)
 - **Zero-Dependency Native Architecture**: 100% pure CommonJS on native Node.js core APIs (`node:crypto`, `node:vm`, `node:worker_threads`, `node:net`, `node:os`, `node:events`, `node:v8`, `node:http`, `node:dgram`, `node:cluster`, `node:test`, `node:assert`).
 - **All Core Test Suites Passing**: 100% pass across Node.js runtime test matrix.
 - **Phase 1 Complete**: All audited bugs in router, crypto, node, ledger, sandbox, and orchestrator resolved.

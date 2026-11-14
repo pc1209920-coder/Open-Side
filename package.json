@@ -1,6 +1,6 @@
 {
   "name": "open-side-protocol",
-  "version": "0.9.0-beta",
+  "version": "0.9.1-beta",
   "description": "Hardware-agnostic, zero-dependency decentralized P2P standby compute grid (Single Compute Sea protocol) pooling idle hardware for distributed task execution.",
   "main": "src/index.js",
   "type": "commonjs",

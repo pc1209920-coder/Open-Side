@@ -1666,6 +1666,7 @@ class ComputeSea extends EventEmitter {
           resultOutput = execRes.output;
           executionTimeMs = execRes.executionTimeMs;
           proofOfCompute = lbCrypto.signProofOfCompute(decryptedShard.shardId, resultOutput, peer.publicKey);
+          pocSecret = peer.publicKey;
         }
       }
 

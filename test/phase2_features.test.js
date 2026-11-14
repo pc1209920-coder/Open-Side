@@ -313,7 +313,7 @@ test('Part 3: Drop-in AI/Agent HTTP Gateway (/v1/chat/completions, /v1/embedding
     assert.strictEqual(healthRes.statusCode, 200);
     assert.strictEqual(healthRes.body.status, 'ok');
     assert.strictEqual(healthRes.body.protocol, 'open-side-protocol');
-    assert.strictEqual(healthRes.body.version, '0.6.0');
+    assert.ok(healthRes.body.version.includes('0.9.1-beta'));
 
     // 2. GET /v1/models (OpenAI compatibility)
     const modelsRes = await httpRequest(ipcPath, 'GET', '/v1/models');

@@ -269,7 +269,7 @@ class OpenSideGateway {
       }
       return this._sendJson(res, 200, {
         status: 'ok',
-        version: '0.6.0',
+        version: '0.9.1-beta',
         protocol: 'open-side-protocol',
         nodeId: this.sea ? this.sea.nodeId : null,
         telemetry

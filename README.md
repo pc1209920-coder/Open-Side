@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18.0.0-green.svg)](https://nodejs.org/)
-[![Architecture](https://img.shields.io/badge/Architecture-Single%20Compute%20Sea%20v0.9.0--beta-purple.svg)](#-single-compute-sea-architecture)
+[![Architecture](https://img.shields.io/badge/Architecture-Single%20Compute%20Sea%20v0.9.1--beta-purple.svg)](#-single-compute-sea-architecture)
 [![Security](https://img.shields.io/badge/Crypto-ECDH%20%2B%20HKDF--SHA512%20%2B%20AES--256--GCM-red.svg)](./SECURITY.md)
 [![Roadmap](https://img.shields.io/badge/Roadmap-ROADMAP.md-blueviolet.svg)](./ROADMAP.md)
 [![Zero-Dependency](https://img.shields.io/badge/Dependencies-0%20Zero-brightgreen.svg)](./package.json)
